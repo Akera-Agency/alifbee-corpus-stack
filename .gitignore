@@ -205,3 +205,8 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Al Jazeera Scraper - Sensitive configuration
+packages/al-jazeera-scrapper/settings.json
+packages/al-jazeera-scrapper/*.log
+packages/al-jazeera-scrapper/aljazeera_*.json

@@ -1,0 +1,21 @@
+{
+  "proxy": {
+    "url": "http://username:password@proxy.example.com:8080"
+  },
+  "scraper": {
+    "max_concurrent_requests": 10,
+    "request_delay": 1,
+    "batch_size": 5,
+    "base_url": "https://aljazeera.net",
+    "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+  },
+  "logging": {
+    "level": "INFO",
+    "file": "aljazeera_scraper.log"
+  },
+  "retry": {
+    "max_retries": 3,
+    "backoff_factor": 2.0,
+    "retry_statuses": [429, 500, 502, 503, 504]
+  }
+}
