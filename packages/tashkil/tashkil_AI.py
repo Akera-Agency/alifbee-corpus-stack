@@ -1,7 +1,52 @@
 import requests
 import time
 import os
+from pathlib import Path
+import json
 
+def load_settings(self, settings_file: str):
+        """Load configuration from settings.json file"""
+        settings_path = Path(__file__).parent / settings_file
+        
+        # Default settings
+        default_settings = {
+            "proxy": {"url": ""},
+            "scraper": {
+                "max_concurrent_requests": 10,
+                "request_delay": 1,
+                "batch_size": 5,
+                "base_url": "https://aljazeera.net",
+                "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+            },
+            "logging": {"level": "INFO", "file": "aljazeera_scraper.log"},
+            "retry": {"max_retries": 3, "backoff_factor": 2.0, "retry_statuses": [429, 500, 502, 503, 504]}
+        }
+        
+        try:
+            if settings_path.exists():
+                with open(settings_path, 'r') as f:
+                    settings = json.load(f)
+            else:
+                settings = default_settings
+                # Create settings file with defaults
+                with open(settings_path, 'w') as f:
+                    json.dump(default_settings, f, indent=2)
+                print(f"Created default settings file: {settings_path}")
+        except Exception as e:
+            print(f"Error loading settings: {e}. Using defaults.")
+            settings = default_settings
+            
+        # Apply settings
+        self.proxy_url = settings["proxy"]["url"]
+        self.base_url = settings["scraper"]["base_url"]
+        self.max_concurrent = settings["scraper"]["max_concurrent_requests"]
+        self.request_delay = settings["scraper"]["request_delay"]
+        self.batch_size = settings["scraper"]["batch_size"]
+        self.user_agent = settings["scraper"]["user_agent"]
+        self.log_level = settings["logging"]["level"]
+        self.log_file = settings["logging"]["file"]
+        self.retry_settings = settings["retry"]
+      
 class TashkilAI:
     def __init__(self, api_key, model="google/gemini-2.5-flash-lite"):
         self.api_key = api_key
