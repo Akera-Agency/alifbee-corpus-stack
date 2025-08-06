@@ -300,6 +300,8 @@ class AlJazeeraScraper:
             
             # Extract article paragraphs (HTML)
             paragraph_elems = soup.select('#main-content-area > div.wysiwyg.wysiwyg--all-content > *')
+            
+            aritcle_html = soup.select_one('#main-content-area > div.wysiwyg.wysiwyg--all-content')
             article_paragraphs_html = [str(elem) for elem in paragraph_elems]
             
             # Extract images
@@ -332,7 +334,7 @@ class AlJazeeraScraper:
                 'title': title,
                 'topics': topics,
                 'content': content_text,
-                'content_html': f"<article>{''.join(f'<p>{p}</p>' for p in article_paragraphs_html)}</article>",
+                'content_html': aritcle_html,
                 'images': images,
                 'metadata': metadata,
                 'content_length': len(content_text)
