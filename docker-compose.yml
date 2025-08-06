@@ -1,0 +1,53 @@
+services:
+  ollama:
+    volumes:
+      - ollama:/root/.ollama
+    container_name: ollama
+    pull_policy: always
+    tty: true
+    restart: unless-stopped
+    image: ollama/ollama:${OLLAMA_DOCKER_TAG-latest}
+    ports:
+      - "11434:11434"
+    environment:
+      - OLLAMA_MODELS=/root/.ollama/models
+      - OLLAMA_HOST=0.0.0.0:11434
+      - OLLAMA_CONTEXT_LENGTH=2048
+      - OLLAMA_NUM_THREADS=4
+
+  open-webui:
+    build:
+      context: .
+      args:
+        OLLAMA_BASE_URL: "/ollama"
+      dockerfile: Dockerfile
+    image: ghcr.io/open-webui/open-webui:${WEBUI_DOCKER_TAG-main}
+    container_name: open-webui
+    volumes:
+      - open-webui:/app/backend/data
+    depends_on:
+      - ollama
+    ports:
+      - ${OPEN_WEBUI_PORT-3000}:8080
+    environment:
+      - "OLLAMA_BASE_URL=http://ollama:11434"
+      - "WEBUI_SECRET_KEY="
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    restart: unless-stopped
+
+  tashkil:
+    build:
+      context: ./packages/tashkil
+      dockerfile: Dockerfile
+    container_name: tashkil
+    depends_on:
+      - ollama
+    volumes:
+      - ./packages/tashkil:/app
+    ports:
+      - "5001:5000"
+
+volumes:
+  ollama: {}
+  open-webui: {}
