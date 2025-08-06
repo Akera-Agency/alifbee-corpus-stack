@@ -1,46 +1,54 @@
 import requests
-import pyarabic.araby as araby
-import re
+import time
+import os
 
 class TashkilAI:
-    def __init__(self, model="neural-chat:latest", base_url="http://localhost:11434"):
+    def __init__(self, api_key, model="google/gemini-2.5-flash-lite"):
+        self.api_key = api_key
         self.model = model
-        self.base_url = base_url
-        self.api_endpoint = f"{base_url}/api/chat"  # Using Ollama's chat endpoint
+        self.base_url = "https://openrouter.ai/api/v1/chat/completions"
 
     def tashkeel(self, text):
         """
-        Add diacritics to Arabic text using the local Ollama model.
-        
+        Add diacritics to Arabic text using OpenRouter AI API.
+
         Args:
             text (str): Arabic text without diacritics
-            
+
         Returns:
             str: Arabic text with diacritics
         """
-        prompt = f"""You are an expert in Arabic diacritization. Your task is to add diacritical marks to Arabic text.
+        if not self.api_key:
+            raise ValueError("GEMINI_API_KEY environment variable is not set")
 
-EXAMPLES:
-Input: قال محمد
-Output: قَالَ مُحَمَّدٌ
+        start_time = time.time()
 
-Input: كتب الطالب الدرس
-Output: كَتَبَ الطَّالِبُ الدَّرْسَ
+        prompt = f"""<task>
+  <instructions>
+    You are an expert in Arabic diacritization (Tashkil).
 
-RULES:
-1. Add ALL diacritical marks (fatha, damma, kasra, sukun, shadda, tanwin)
-2. Do not change any letters or words
-3. Do not add any explanations
-4. Return only the text with diacritics
+    Your task is to add accurate diacritical marks (harakat) to the following full Arabic article.
 
-INPUT TEXT:
-{text}
+    Please follow these rules strictly:
+    1. Do not modify the words or meaning in any way.
+    2. Preserve the original structure — paragraphs, punctuation, quotes, and line breaks must remain untouched.
+    3. Add diacritics to every word, including proper nouns, verbs, and grammatical particles.
+  </instructions>
 
-OUTPUT (with diacritics):"""
-        
+  <article_input>
+    {text}
+  </article_input>
+</task>"""
+
         try:
             response = requests.post(
-                self.api_endpoint,
+                url=self.base_url,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://github.com/alifbee/alifbee-corpus-stack",  # Optional
+                    "X-Title": "Alifbee Tashkil"  # Optional
+                },
                 json={
                     "model": self.model,
                     "messages": [
@@ -52,50 +60,30 @@ OUTPUT (with diacritics):"""
                             "role": "user",
                             "content": prompt
                         }
-                    ],
-                    "stream": False
+                    ]
                 }
             )
             response.raise_for_status()
             result = response.json()
-            return result["message"]["content"].strip()
+
+            if "choices" in result and result["choices"]:
+                return result["choices"][0]["message"]["content"].strip()
+            else:
+                print("Unexpected response format:", result)
+                return text
+
         except Exception as e:
             print(f"Error in tashkeel request: {e}")
             return text  # Return original text if request fails
 
-def clean_arabic_text(text):
-    text = araby.strip_tashkeel(text)
-    text = araby.strip_tatweel(text)
-    punctuation = ['،', ',', '.']
-    for p in punctuation:
-        text = text.replace(p, '')
-    return text
-
-def split_into_sentences(text):
-    endings = r'[.!؟]+'
-    sentences = re.split(f'({endings})\\s+', text)
-    cleaned = []
-    for i in range(0, len(sentences)-1, 2):
-        if i+1 < len(sentences):
-            sentence = clean_arabic_text(sentences[i] + sentences[i+1])
-        else:
-            sentence = clean_arabic_text(sentences[i])
-        if sentence.strip():
-            cleaned.append(sentence)
-    if len(sentences) % 2 == 1 and sentences[-1].strip():
-        cleaned.append(clean_arabic_text(sentences[-1]))
-    return cleaned
-
 # Example usage
 if __name__ == "__main__":
+    api_key = os.getenv("GEMINI_API_KEY")  # Ensure this env var is set
     text = """
-         قال فرحان حق -نائب المتحدث باسم الأمين العام للأمم المتحدة- إن كل ما يتم إدخاله من طعام ووقود لا يفي باحتياجات قطاع غزة، مؤكدا أن إنقاذ مليوني إنسان يتضورون جوعا يتطلب فتحا كاملا للمعابر. وفي مقابلة مع الجزيرة، أكد حق أن القطاع بحاجة لدخول 500 شاحنة مساعدات يوميا على الأقل، لأن الناس يحصلون على وجبتي طعام كل 3 أيام. وأضاف أن كل ما يتم إدخاله للقطاع لا يكفي حاجة السكان، لأن هناك حالة جوع كبيرة، والأطفال بحاجة شديدة للغذاء والمكملات الغذائية، مؤكدا أن المطلوب حاليا هو إدخال المساعدات برا، وإعادة عمل شبكة التوزيع التابعة للأمم المتحدة. وتكمن المشكلة -وفق المسؤول الأممي- في سيطرة إسرائيل على كافة المعابر، وقيامها بعمليات تفتيش معقدة وطويلة في المعبرين اللذين سمح للأمم المتحدة بإدخال المساعدات منهما. وفي وقت سابق اليوم، قال مفوض الأمم المتحدة لحقوق الإنسان فولكر تورك إن الصور المقبلة من غزة لأشخاص يتضورون جوعا \"مفجعة ولا تطاق\". وأكد تورك أن وصول غزة إلى هذه المرحلة \"يعتبر إهانة لإنسانيتنا\"، وأن إسرائيل \"تواصل فرض قيود صارمة على دخول المساعدات الإنسانية للقطاع\".
+    قال المتحدث باسم وكالة غوث وتشغيل اللاجئين الفلسطينيين (أونروا) عدنان أبو حسنة، إن مراكز الإيواء في مدينة غزة وشمالها "مليئة بالكامل"، وإن عشرات آلاف العائلات تعيش أوضاعًا إنسانية صعبة للغاية.
     """
-    
-    vocalizer = TashkilAI()
-    sentences = split_into_sentences(text)
-    
-    print("\n=== Sentences with AI-Generated Diacritics ===\n")
-    for i, sentence in enumerate(sentences, 1):
-        vocalized_sentence = vocalizer.tashkeel(sentence)
-        print(f"\nSentence {i}:\n{vocalized_sentence}\n{'='*50}")
+
+    vocalizer = TashkilAI(api_key)
+    vocalized_text = vocalizer.tashkeel(text)
+    print("\n=== Text with AI-Generated Diacritics ===\n")
+    print(vocalized_text)
