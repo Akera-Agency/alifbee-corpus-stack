@@ -10,14 +10,31 @@ import sys
 import json
 import random
 import time
-from typing import List, Optional, Dict, Any, Set
+import re
+import uuid 
+from typing import List, Optional, Dict, Any, Set, Tuple
 from urllib.parse import urljoin, urlparse
 from dataclasses import dataclass
 from pathlib import Path
+from dotenv import load_dotenv
+
+# Load environment variables from .env file if it exists
+load_dotenv()
 
 import aiohttp
 import xmltodict
 from bs4 import BeautifulSoup
+
+# Import TashkilUnified from tashkil package
+sys.path.append(str(Path(__file__).parent.parent))
+from tashkil.tashkil_unified import TashkilUnified
+
+from supabase import create_client, Client
+
+# Initialize Supabase client - will be set up in __init__ if environment variables are present
+url: str = os.environ.get("SUPABASE_URL")
+key: str = os.environ.get("SUPABASE_KEY")
+supabase: Client = None  # Will be initialized in the class if URL and key are available
 
 @dataclass 
 class RetryConfig:
@@ -40,12 +57,59 @@ class AlJazeeraScraper:
         self.setup_session_config()
         self.setup_retry_config()
         
+        # Initialize Supabase
+        global supabase
+        if url and key:
+            try:
+                supabase = create_client(url, key)
+                self.logger.info("Supabase client initialized successfully")
+                self.supabase_enabled = True
+            except Exception as e:
+                self.logger.error(f"Failed to initialize Supabase client: {str(e)}")
+                self.supabase_enabled = False
+        else:
+            self.logger.warning("SUPABASE_URL or SUPABASE_KEY not found. Database storage will be disabled.")
+            self.supabase_enabled = False
+        
+        # Initialize TashkilUnified
+        api_key = os.environ.get("GEMINI_API_KEY")
+        tashkil_method = os.environ.get("TASHKIL_METHOD", "gemini").lower()
+        
+        if tashkil_method == "mishkal":
+            try:
+                self.tashkil_ai = TashkilUnified(method="mishkal")
+                self.logger.info("Initialized TashkilUnified with Mishkal method")
+            except Exception as e:
+                self.logger.warning(f"Failed to initialize Mishkal: {str(e)}. Falling back to Gemini.")
+                if api_key:
+                    self.tashkil_ai = TashkilUnified(method="gemini", api_key=api_key)
+                    self.logger.info("Initialized TashkilUnified with Gemini method (fallback)")
+                else:
+                    self.logger.warning("GEMINI_API_KEY not found. Tashkil functionality will be disabled.")
+                    self.tashkil_ai = None
+        elif tashkil_method == "gemini":
+            if not api_key:
+                self.logger.warning("GEMINI_API_KEY not found. Tashkil functionality will be disabled.")
+                self.tashkil_ai = None
+            else:
+                self.tashkil_ai = TashkilUnified(method="gemini", api_key=api_key)
+                self.logger.info("Initialized TashkilUnified with Gemini method")
+        else:
+            self.logger.warning(f"Unknown TASHKIL_METHOD: {tashkil_method}. Using Gemini if API key available.")
+            if api_key:
+                self.tashkil_ai = TashkilUnified(method="gemini", api_key=api_key)
+                self.logger.info("Initialized TashkilUnified with Gemini method")
+            else:
+                self.tashkil_ai = None
+        
         # Stats tracking
         self.stats = {
             'sitemaps_processed': 0,
             'articles_found': 0,
             'articles_scraped': 0,
-            'articles_failed': 0
+            'articles_failed': 0,
+            'sentences_processed': 0,
+            'words_processed': 0
         }
         
     def load_settings(self, settings_file: str):
@@ -122,6 +186,70 @@ class AlJazeeraScraper:
             self.logger.info(f"Using proxy with automatic rotation: {self.proxy_url[-30:]}")
         else:
             self.logger.info("No proxy configured")
+            
+    def split_into_sentences(self, text: str) -> List[str]:
+        """Split Arabic text into sentences"""
+        if not text:
+            return []
+            
+        # Arabic sentence endings: period, question mark, exclamation mark
+        sentence_endings = r'[.!؟\?]'
+        
+        # Split by sentence endings followed by space or end of string
+        sentences = re.split(f'({sentence_endings}\\s|{sentence_endings}$)', text)
+        
+        # Combine sentence with its ending punctuation
+        result = []
+        for i in range(0, len(sentences) - 1, 2):
+            if i + 1 < len(sentences):
+                result.append(sentences[i] + sentences[i+1].strip())
+            else:
+                result.append(sentences[i])
+                
+        # Add the last part if it's not empty and wasn't added
+        if len(sentences) % 2 != 0 and sentences[-1].strip():
+            result.append(sentences[-1].strip())
+            
+        # Filter out empty sentences
+        return [s.strip() for s in result if s.strip()]
+        
+    def extract_words(self, text: str) -> List[str]:
+        """Extract individual words from Arabic text"""
+        if not text:
+            return []
+            
+        # Split by whitespace and remove empty strings
+        words = [word.strip() for word in re.split(r'\s+', text) if word.strip()]
+        
+        # Remove punctuation from words and filter out non-Arabic words
+        clean_words = []
+        for word in words:
+            # Remove punctuation at start/end of word
+            clean_word = re.sub(r'^[\W]+|[\W]+$', '', word)
+            
+            # Skip words containing English letters or numbers
+            if re.search(r'[a-zA-Z0-9]', clean_word):
+                continue
+                
+            # Only include non-empty words
+            if clean_word:
+                clean_words.append(clean_word)
+                
+        return clean_words
+        
+    def extract_word_without_tashkil(self, word_with_tashkil: str) -> str:
+        """Remove tashkil (diacritics) from Arabic word"""
+        # Arabic diacritics Unicode ranges
+        arabic_diacritics = re.compile(r'[\u064B-\u065F\u0670]')
+        return arabic_diacritics.sub('', word_with_tashkil)
+        
+    def generate_word_id(self, word: str) -> str:
+        """Generate a deterministic ID for a word based on its content"""
+        # Use a hash of the word as the ID
+        import hashlib
+        # Create a UUID based on the hash of the word
+        word_hash = hashlib.md5(word.encode('utf-8')).hexdigest()
+        return str(uuid.UUID(word_hash))
         
     def setup_session_config(self):
         """Setup session configuration"""
@@ -282,6 +410,116 @@ class AlJazeeraScraper:
         
         return text
         
+    def clean_tashkil_output(self, text: str) -> str:
+        """Clean up the tashkil output by removing AI instructions and XML tags"""
+        # Remove any XML/HTML-like tags that might be in the response
+        text = re.sub(r'<task>.*?</task>', '', text, flags=re.DOTALL)
+        text = re.sub(r'<instructions>.*?</instructions>', '', text, flags=re.DOTALL)
+        text = re.sub(r'<article_input>.*?</article_input>', '', text, flags=re.DOTALL)
+        
+        # Remove any remaining XML/HTML tags
+        text = re.sub(r'<[^>]+>', '', text)
+        
+        # Remove lines that might contain AI instructions
+        lines_to_remove = [
+            "You are an expert in Arabic diacritization",
+            "Your task is to add accurate",
+            "Please follow these rules",
+            "Do not modify the words",
+            "Preserve the original structure",
+            "Add diacritics to every word",
+            "Here is the text with diacritics:",
+            "Text with diacritics:"
+        ]
+        
+        for line in lines_to_remove:
+            text = re.sub(r'.*' + re.escape(line) + r'.*\n?', '', text, flags=re.IGNORECASE)
+        
+        # Clean up extra whitespace
+        text = re.sub(r'\s+', ' ', text).strip()
+        
+        return text
+        
+    def filter_non_arabic(self, text: str) -> str:
+        """Filter out numbers and English letters from text"""
+        # Replace English letters and numbers with spaces
+        text = re.sub(r'[a-zA-Z0-9]+', ' ', text)
+        
+        # Clean up extra whitespace created by replacements
+        text = re.sub(r'\s+', ' ', text).strip()
+        
+        return text
+    
+    async def process_tashkil(self, text: str) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Process text through TashkilAI and prepare database records"""
+        # Process the entire article at once with TashkilAI
+        full_tashkil_text = ""
+        if self.tashkil_ai:
+            try:
+                self.logger.info(f"Adding tashkil to full article ({len(text)} chars)...")
+                raw_tashkil_output = self.tashkil_ai.tashkeel(text)
+                # Clean up the output to remove any AI instructions
+                full_tashkil_text = self.clean_tashkil_output(raw_tashkil_output)
+                self.logger.info(f"Successfully added tashkil to full article")
+            except Exception as e:
+                self.logger.error(f"Error adding tashkil to full article: {str(e)}")
+                full_tashkil_text = text  # Fallback to original
+        else:
+            full_tashkil_text = text  # No TashkilAI available
+            
+        # Note: We don't filter the full article text here to preserve it for JSON storage
+        # Filtering will be applied to individual sentences
+            
+        # Split original and tashkil text into sentences
+        original_sentences = self.split_into_sentences(text)
+        tashkil_sentences = self.split_into_sentences(full_tashkil_text)
+        
+        # Make sure we have the same number of sentences
+        # If not, fall back to original sentences
+        if len(original_sentences) != len(tashkil_sentences):
+            self.logger.warning(f"Sentence count mismatch: original={len(original_sentences)}, tashkil={len(tashkil_sentences)}")
+            self.logger.warning("Using original sentences as fallback")
+            tashkil_sentences = original_sentences
+            
+        self.stats['sentences_processed'] += len(original_sentences)
+        
+        # Process sentences and words
+        sentence_records = []
+        word_records = []
+        
+        # Process each sentence
+        for i, (original_sentence, tashkil_sentence) in enumerate(zip(original_sentences, tashkil_sentences)):
+            # Use index as temporary ID for reference
+            temp_sentence_id = str(i)  # We'll let Supabase generate the real IDs
+            
+            # Filter out non-Arabic characters from sentences
+            filtered_original = self.filter_non_arabic(original_sentence)
+            filtered_tashkil = self.filter_non_arabic(tashkil_sentence)
+            
+            # Create sentence record (without article_id, will be set later)
+            sentence_records.append({
+                "id": temp_sentence_id,  # Temporary ID for reference
+                "text": filtered_original,
+                "tashkil": filtered_tashkil
+            })
+            
+            # Process words in the sentence with tashkil
+            words_with_tashkil = self.extract_words(tashkil_sentence)
+            self.stats['words_processed'] += len(words_with_tashkil)
+            
+            for word_with_tashkil in words_with_tashkil:
+                # Extract word without tashkil
+                word_without_tashkil = self.extract_word_without_tashkil(word_with_tashkil)
+                
+                # Create word record (without real sentence_id, will be set later)
+                word_records.append({
+                    "word": word_with_tashkil,
+                    "word_without_ichkal": word_without_tashkil,
+                    "sentence_id": temp_sentence_id  # Temporary ID for reference
+                })
+        
+        return full_tashkil_text, sentence_records, word_records
+    
     def extract_article_data(self, html_content: str, url: str) -> Dict[str, Any]:
         """Step 3: Extract structured data from article HTML (matching n8n selectors)"""
         if not html_content:
@@ -301,15 +539,23 @@ class AlJazeeraScraper:
             # Extract article paragraphs (HTML)
             paragraph_elems = soup.select('#main-content-area > div.wysiwyg.wysiwyg--all-content > *')
             
-            aritcle_html = soup.select_one('#main-content-area > div.wysiwyg.wysiwyg--all-content')
+            article_html = soup.select_one('#main-content-area > div.wysiwyg.wysiwyg--all-content')
             article_paragraphs_html = [str(elem) for elem in paragraph_elems]
             
             # Extract images
             img_elems = soup.select('main img')
             images = []
             for img in img_elems:
+                img_url = img.get('src', '')
+                # Add base URL if the image URL is relative
+                if img_url and not img_url.startswith('http'):
+                    if img_url.startswith('/'):
+                        img_url = f"https://www.aljazeera.net{img_url}"
+                    else:
+                        img_url = f"https://www.aljazeera.net/{img_url}"
+                
                 images.append({
-                    'url': img.get('src', ''),
+                    'url': img_url,
                     'alt': img.get('alt', '')
                 })
             
@@ -329,21 +575,183 @@ class AlJazeeraScraper:
             if not content_text or len(content_text.strip()) < 50:
                 return {'url': url, 'error': 'Content too short or empty'}
             
+            # Generate slug from URL
+            parsed_url = urlparse(url)
+            slug = parsed_url.path.strip('/').split('/')[-1]
+            
+            # Extract published date from metadata
+            published_at = metadata.get('article:published_time', None)
+            
+            # Extract image URLs (already processed with full URLs)
+            image_urls = [img['url'] for img in images if img['url']]
+            
             return {
                 'url': url,
                 'title': title,
                 'topics': topics,
                 'content': content_text,
-                'content_html': aritcle_html,
+                'content_html': article_html,
                 'images': images,
+                'image_urls': image_urls,
                 'metadata': metadata,
+                'slug': slug,
+                'published_at': published_at,
+                'tags': topics,  # Using topics as tags
+                'categories': [],  # No specific category extraction
                 'content_length': len(content_text)
+                # Let Supabase generate the ID
             }
             
         except Exception as e:
             self.logger.error(f"Failed to extract data from {url}: {str(e)}")
             return {'url': url, 'error': f"Extraction failed: {str(e)}"}
             
+    async def save_to_json(self, article_data: Dict[str, Any], sentences: List[Dict[str, Any]], words: List[Dict[str, Any]]) -> str:
+        """Save article data, sentences, and words to a JSON file in the data directory"""
+        try:
+            # Create a complete data structure
+            complete_data = {
+                "article": {
+                    "url": article_data["url"],
+                    "title": article_data["title"],
+                    "metadata": article_data["metadata"],
+                    "slug": article_data["slug"],
+                    "published_at": article_data["published_at"],
+                    "tags": article_data["tags"],
+                    "categories": article_data["categories"],
+                    "image_urls": article_data["image_urls"],
+                    "content": article_data["content"],
+                    "tashkil": article_data.get("tashkil", "")
+                },
+                "sentences": sentences,
+                "words": words
+            }
+            
+            # Create data directory if it doesn't exist
+            data_dir = Path("data")
+            data_dir.mkdir(exist_ok=True)
+            
+            # Create filename based on slug and timestamp
+            timestamp = int(time.time())
+            filename = f"article_{article_data['slug']}_{timestamp}.json"
+            filepath = data_dir / filename
+            
+            # Write to file
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(complete_data, f, indent=2, ensure_ascii=False)
+                
+            self.logger.info(f"Saved article data to {filepath}")
+            return str(filepath)
+            
+        except Exception as e:
+            self.logger.error(f"Failed to save article data to JSON: {str(e)}")
+            return ""
+    
+    async def store_in_supabase(self, article_data: Dict[str, Any], sentences: List[Dict[str, Any]], words: List[Dict[str, Any]]) -> bool:
+        """Store article data, sentences, and words in Supabase"""
+        if not self.supabase_enabled or not supabase:
+            self.logger.warning("Supabase storage is disabled. Skipping database storage.")
+            return False
+            
+        try:
+            # Store article (let Supabase generate the ID)
+            article_record = {
+                "url": article_data["url"],
+                "title": article_data["title"],
+                "metadata": article_data["metadata"],
+                "slug": article_data["slug"],
+                "published_at": article_data["published_at"],
+                "tags": article_data["tags"],
+                "categories": article_data["categories"],
+                "image_urls": article_data["image_urls"],
+                "content": article_data["content"],
+                "tashkil": article_data.get("tashkil", "")
+            }
+            
+            # Insert article and get the generated ID
+            article_result = supabase.table("articles").upsert(article_record).execute()
+            
+            # Extract the generated article ID
+            if article_result and article_result.data and len(article_result.data) > 0:
+                article_id = article_result.data[0].get('id')
+                self.logger.info(f"Stored article in Supabase with ID {article_id}: {article_data['title'][:30]}...")
+                
+                # Create a mapping from temp IDs to sentences
+                temp_id_to_sentence = {}
+                for sentence in sentences:
+                    temp_id = sentence.pop("id", None)  # Remove our temporary ID
+                    sentence["article_id"] = article_id  # Set the actual article ID
+                    temp_id_to_sentence[temp_id] = sentence
+                
+                # Insert sentences in batches
+                batch_size = 50
+                sentence_batches = []
+                for i in range(0, len(sentences), batch_size):
+                    sentence_batches.append(sentences[i:i + batch_size])
+                
+                # Track inserted sentences and their IDs
+                sentence_id_map = {}  # Maps temp_id to real UUID
+                
+                # Insert each batch of sentences
+                for batch in sentence_batches:
+                    sentences_result = supabase.table("sentences").upsert(batch).execute()
+                    
+                    if sentences_result and sentences_result.data:
+                        # Match the returned sentences with our original ones by position
+                        for i, sentence_record in enumerate(sentences_result.data):
+                            if i < len(batch):
+                                # Find the temp_id for this sentence
+                                for temp_id, sent in temp_id_to_sentence.items():
+                                    if sent is batch[i]:  # Compare by reference
+                                        sentence_id_map[temp_id] = sentence_record.get('id')
+                                        break
+                    
+                    self.logger.info(f"Stored {len(batch)} sentences in Supabase")
+                
+                # Update word records with real sentence IDs and save all words (including duplicates)
+                processed_words = []
+                for word in words:
+                    temp_sentence_id = word.pop("sentence_id", None)
+                    if temp_sentence_id in sentence_id_map:
+                        word["sentence_id"] = sentence_id_map[temp_sentence_id]
+                        
+                        # Generate a unique ID for each word instance (including duplicates)
+                        word["id"] = self.generate_word_id(word["word"] + str(len(processed_words)))
+                        
+                        processed_words.append(word)
+                
+                self.logger.info(f"Processing {len(processed_words)} words (including duplicates)")
+                
+                # Insert words in batches
+                for i in range(0, len(processed_words), batch_size):
+                    batch = [w for w in processed_words[i:i + batch_size] if "sentence_id" in w]  # Only include words with valid sentence_id
+                    if batch:  # Only insert if there are valid words
+                        try:
+                            words_result = supabase.table("word_with_ichkal").upsert(
+                                batch,
+                            ).execute()
+                            self.logger.info(f"Stored {len(batch)} words in Supabase")
+                        except Exception as word_error:
+                            self.logger.warning(f"Error storing words batch: {str(word_error)}")
+                            # Try inserting one by one to salvage what we can
+                            for single_word in batch:
+                                try:
+                                    supabase.table("word_with_ichkal").upsert(
+                                        [single_word],
+                                    ).execute()
+                                except Exception:
+                                    # Skip this word if it fails
+                                    pass
+                
+                return True
+            else:
+                self.logger.error("Failed to get article ID from Supabase response")
+                return False
+            
+        except Exception as e:
+            self.logger.error(f"Failed to store data in Supabase: {str(e)}")
+            return False
+    
     async def scrape_article_batch(self, session: aiohttp.ClientSession, article_urls: List[str]) -> List[Dict[str, Any]]:
         """Process a batch of articles with concurrency control"""
         semaphore = asyncio.Semaphore(self.max_concurrent)
@@ -360,6 +768,22 @@ class AlJazeeraScraper:
                     if not article_data.get('error'):
                         self.stats['articles_scraped'] += 1
                         self.logger.info(f"✅ Extracted: {article_data.get('title', 'No title')[:50]}...")
+                        
+                        # Process content with tashkil
+                        try:
+                            # Add tashkil to content
+                            tashkil_text, sentences, words = await self.process_tashkil(article_data['content'])
+                            article_data['tashkil'] = tashkil_text
+                            
+                            # First save to JSON file
+                            json_file = await self.save_to_json(article_data, sentences, words)
+                            
+                            # Then store in Supabase if JSON save was successful
+                            if json_file:
+                                await self.store_in_supabase(article_data, sentences, words)
+                            
+                        except Exception as e:
+                            self.logger.error(f"Error processing tashkil: {str(e)}")
                     else:
                         self.stats['articles_failed'] += 1
                         self.logger.warning(f"❌ Failed extraction: {url} - {article_data.get('error')}")
@@ -462,6 +886,37 @@ class AlJazeeraScraper:
 
 # CLI interface matching n8n workflow
 async def main():
+    # Check for environment variables (warning only, not required)
+    if not url or not key:
+        print("\n\033[93mWarning: SUPABASE_URL and/or SUPABASE_KEY environment variables are not set.\033[0m")
+        print("Database storage will be disabled. To enable it, set:")
+        print("  export SUPABASE_URL=your_supabase_url")
+        print("  export SUPABASE_KEY=your_supabase_key")
+        
+    # Check for tashkil configuration
+    tashkil_method = os.environ.get("TASHKIL_METHOD", "gemini").lower()
+    api_key = os.environ.get("GEMINI_API_KEY")
+    
+    print(f"\n\033[94m=== Tashkil Configuration ===\033[0m")
+    print(f"Method: {tashkil_method.upper()}")
+    
+    if tashkil_method == "gemini":
+        if not api_key:
+            print("\n\033[93mWarning: GEMINI_API_KEY environment variable is not set.\033[0m")
+            print("Tashkil functionality will be disabled. To enable it, set:")
+            print("  export GEMINI_API_KEY=your_gemini_api_key")
+            print("Continuing without tashkil capability...\n")
+        else:
+            print(f"✓ Gemini API key configured")
+            print(f"✓ Using Gemini 2.5 Flash Lite for Arabic diacritization")
+    elif tashkil_method == "mishkal":
+        print(f"✓ Using Mishkal library for Arabic diacritization")
+        print("Note: Install Mishkal with: pip install mishkal pyarabic")
+    else:
+        print(f"\n\033[93mWarning: Unknown TASHKIL_METHOD: {tashkil_method}\033[0m")
+        print("Valid options: 'gemini' or 'mishkal'")
+        print("Defaulting to Gemini if API key available...\n")
+    
     scraper = AlJazeeraScraper()
     
     # Parse command line arguments
@@ -487,12 +942,18 @@ async def main():
         print(f"Articles found: {stats['articles_found']}")
         print(f"Articles scraped: {stats['successful_articles']}/{stats['total_articles']}")
         print(f"Failed articles: {stats['failed_articles']}")
+        print(f"Sentences processed: {stats.get('sentences_processed', 0)}")
+        print(f"Words processed: {stats.get('words_processed', 0)}")
         print(f"Processing time: {stats['processing_time']:.1f}s")
         print(f"Speed: {stats['articles_per_second']:.2f} articles/second")
         
+        # Create data directory if it doesn't exist
+        data_dir = Path("data")
+        data_dir.mkdir(exist_ok=True)
+        
         # Save results to file
         timestamp = int(time.time())
-        output_file = f"aljazeera_articles_{timestamp}.json"
+        output_file = data_dir / f"aljazeera_articles_{timestamp}.json"
         
         with open(output_file, 'w', encoding='utf-8') as f:
             json.dump(results, f, indent=2, ensure_ascii=False)
@@ -502,10 +963,12 @@ async def main():
         # Save just successful articles to separate file
         successful_articles = [a for a in results['articles'] if not a.get('error')]
         if successful_articles:
-            clean_file = f"aljazeera_clean_{timestamp}.json"
+            clean_file = data_dir / f"aljazeera_clean_{timestamp}.json"
             with open(clean_file, 'w', encoding='utf-8') as f:
                 json.dump(successful_articles, f, indent=2, ensure_ascii=False)
             print(f"💾 Clean articles saved to: {clean_file}")
+            
+        print(f"\n💾 Data stored in Supabase database according to schema")
         
     except KeyboardInterrupt:
         print("\n⏹️ Scraping interrupted by user")

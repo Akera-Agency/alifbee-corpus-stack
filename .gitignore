@@ -214,3 +214,5 @@ packages/al-jazeera-scrapper/aljazeera_*.json
 # Tashkil - Sensitive configuration
 packages/tashkil/settings.json
 .DS_Store
+
+data/
