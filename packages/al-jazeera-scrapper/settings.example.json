@@ -3,9 +3,9 @@
     "url": "http://username:password@proxy.example.com:8080"
   },
   "scraper": {
-    "max_concurrent_requests": 10,
-    "request_delay": 1,
-    "batch_size": 5,
+    "max_concurrent_requests": 100,
+    "request_delay": 0,
+    "batch_size": 50,
     "base_url": "https://aljazeera.net",
     "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
   },

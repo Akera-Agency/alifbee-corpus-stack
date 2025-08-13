@@ -25,6 +25,23 @@ import aiohttp
 import xmltodict
 from bs4 import BeautifulSoup
 
+sys.path.append(os.path.abspath('/Users/macmini/elysia-starter/alifbee/alifbee-corpus-stack/packages/al-jazeera-scrapper'))
+
+# Prefer fast lxml parser if available
+try:
+    import lxml  # noqa: F401
+    BS_PARSER = 'lxml'
+except Exception:
+    BS_PARSER = 'html.parser'
+
+# Precompile commonly used regex patterns for speed
+SENTENCE_SPLIT_RE = re.compile(r'([.!؟\?]\s|[.!؟\?]$)')
+COLLAPSE_WS_RE = re.compile(r'\s+')
+WORD_SPLIT_RE = re.compile(r'\s+')
+PUNCT_EDGES_RE = re.compile(r'^[\W]+|[\W]+$')
+EN_NUM_RE = re.compile(r'[a-zA-Z0-9]')
+ARABIC_DIACRITICS_RE = re.compile(r'[\u064B-\u065F\u0670]')
+
 # Import TashkilUnified from tashkil package
 sys.path.append(str(Path(__file__).parent.parent))
 from tashkil.tashkil_unified import TashkilUnified
@@ -63,7 +80,9 @@ class AlJazeeraScraper:
             try:
                 supabase = create_client(url, key)
                 self.logger.info("Supabase client initialized successfully")
-                self.supabase_enabled = True
+                self.supabase_enabled = os.environ.get("SUPABASE_WRITE", "1") == "1"
+                if not self.supabase_enabled:
+                    self.logger.info("Supabase writes disabled via SUPABASE_WRITE=0")
             except Exception as e:
                 self.logger.error(f"Failed to initialize Supabase client: {str(e)}")
                 self.supabase_enabled = False
@@ -73,9 +92,12 @@ class AlJazeeraScraper:
         
         # Initialize TashkilUnified
         api_key = os.environ.get("GEMINI_API_KEY")
-        tashkil_method = os.environ.get("TASHKIL_METHOD", "gemini").lower()
+        tashkil_method = os.environ.get("TASHKIL_METHOD", "mishkal").lower()
         
-        if tashkil_method == "mishkal":
+        if os.environ.get("TASHKIL_ENABLED", "1") != "1":
+            self.tashkil_ai = None
+            self.logger.info("Tashkil disabled via TASHKIL_ENABLED=0")
+        elif tashkil_method == "mishkal":
             try:
                 self.tashkil_ai = TashkilUnified(method="mishkal")
                 self.logger.info("Initialized TashkilUnified with Mishkal method")
@@ -192,11 +214,8 @@ class AlJazeeraScraper:
         if not text:
             return []
             
-        # Arabic sentence endings: period, question mark, exclamation mark
-        sentence_endings = r'[.!؟\?]'
-        
         # Split by sentence endings followed by space or end of string
-        sentences = re.split(f'({sentence_endings}\\s|{sentence_endings}$)', text)
+        sentences = SENTENCE_SPLIT_RE.split(text)
         
         # Combine sentence with its ending punctuation
         result = []
@@ -219,16 +238,16 @@ class AlJazeeraScraper:
             return []
             
         # Split by whitespace and remove empty strings
-        words = [word.strip() for word in re.split(r'\s+', text) if word.strip()]
+        words = [word.strip() for word in WORD_SPLIT_RE.split(text) if word.strip()]
         
         # Remove punctuation from words and filter out non-Arabic words
         clean_words = []
         for word in words:
             # Remove punctuation at start/end of word
-            clean_word = re.sub(r'^[\W]+|[\W]+$', '', word)
+            clean_word = PUNCT_EDGES_RE.sub('', word)
             
             # Skip words containing English letters or numbers
-            if re.search(r'[a-zA-Z0-9]', clean_word):
+            if EN_NUM_RE.search(clean_word):
                 continue
                 
             # Only include non-empty words
@@ -239,9 +258,7 @@ class AlJazeeraScraper:
         
     def extract_word_without_tashkil(self, word_with_tashkil: str) -> str:
         """Remove tashkil (diacritics) from Arabic word"""
-        # Arabic diacritics Unicode ranges
-        arabic_diacritics = re.compile(r'[\u064B-\u065F\u0670]')
-        return arabic_diacritics.sub('', word_with_tashkil)
+        return ARABIC_DIACRITICS_RE.sub('', word_with_tashkil)
         
     def generate_word_id(self, word: str) -> str:
         """Generate a deterministic ID for a word based on its content"""
@@ -257,7 +274,7 @@ class AlJazeeraScraper:
             'User-Agent': self.user_agent,
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.5',
-            'Accept-Encoding': 'gzip, deflate',
+            'Accept-Encoding': 'gzip, deflate, br',
             'Connection': 'keep-alive',
         }
         
@@ -295,7 +312,7 @@ class AlJazeeraScraper:
                     content = await response.text()
                     
                     if response.status == 200:
-                        self.logger.info(f"SUCCESS {url} ({len(content)} chars)")
+                        self.logger.debug(f"SUCCESS {url} ({len(content)} chars)")
                         return {
                             'url': url,
                             'status': response.status,
@@ -389,7 +406,7 @@ class AlJazeeraScraper:
         cleaned_html = html_content
         
         # Remove script and style tags with their content
-        cleaned_html = BeautifulSoup(cleaned_html, 'html.parser')
+        cleaned_html = BeautifulSoup(cleaned_html, BS_PARSER)
         for script in cleaned_html(["script", "style"]):
             script.decompose()
         
@@ -405,8 +422,7 @@ class AlJazeeraScraper:
                 )
         
         # Collapse multiple spaces into single space
-        import re
-        text = re.sub(r'\s+', ' ', text).strip()
+        text = COLLAPSE_WS_RE.sub(' ', text).strip()
         
         return text
         
@@ -436,17 +452,17 @@ class AlJazeeraScraper:
             text = re.sub(r'.*' + re.escape(line) + r'.*\n?', '', text, flags=re.IGNORECASE)
         
         # Clean up extra whitespace
-        text = re.sub(r'\s+', ' ', text).strip()
+        text = COLLAPSE_WS_RE.sub(' ', text).strip()
         
         return text
         
     def filter_non_arabic(self, text: str) -> str:
         """Filter out numbers and English letters from text"""
         # Replace English letters and numbers with spaces
-        text = re.sub(r'[a-zA-Z0-9]+', ' ', text)
+        text = EN_NUM_RE.sub(' ', text)
         
         # Clean up extra whitespace created by replacements
-        text = re.sub(r'\s+', ' ', text).strip()
+        text = COLLAPSE_WS_RE.sub(' ', text).strip()
         
         return text
     
@@ -457,7 +473,7 @@ class AlJazeeraScraper:
         if self.tashkil_ai:
             try:
                 self.logger.info(f"Adding tashkil to full article ({len(text)} chars)...")
-                raw_tashkil_output = self.tashkil_ai.tashkeel(text)
+                raw_tashkil_output = await asyncio.to_thread(self.tashkil_ai.tashkeel, text)
                 # Clean up the output to remove any AI instructions
                 full_tashkil_text = self.clean_tashkil_output(raw_tashkil_output)
                 self.logger.info(f"Successfully added tashkil to full article")
@@ -478,8 +494,6 @@ class AlJazeeraScraper:
         # If not, fall back to original sentences
         if len(original_sentences) != len(tashkil_sentences):
             self.logger.warning(f"Sentence count mismatch: original={len(original_sentences)}, tashkil={len(tashkil_sentences)}")
-            self.logger.warning("Using original sentences as fallback")
-            tashkil_sentences = original_sentences
             
         self.stats['sentences_processed'] += len(original_sentences)
         
@@ -526,7 +540,7 @@ class AlJazeeraScraper:
             return {'url': url, 'error': 'No content'}
             
         try:
-            soup = BeautifulSoup(html_content, 'html.parser')
+            soup = BeautifulSoup(html_content, BS_PARSER)
             
             # Extract title
             title_elem = soup.select_one('#main-content-area > header > h1')
@@ -590,7 +604,7 @@ class AlJazeeraScraper:
                 'title': title,
                 'topics': topics,
                 'content': content_text,
-                'content_html': article_html,
+                'content_html': str(article_html) if article_html else "",
                 'images': images,
                 'image_urls': image_urls,
                 'metadata': metadata,
@@ -636,9 +650,9 @@ class AlJazeeraScraper:
             filename = f"article_{article_data['slug']}_{timestamp}.json"
             filepath = data_dir / filename
             
-            # Write to file
-            with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump(complete_data, f, indent=2, ensure_ascii=False)
+            # Serialize and write without blocking the event loop
+            json_str = json.dumps(complete_data, indent=2, ensure_ascii=False)
+            await asyncio.to_thread(filepath.write_text, json_str, 'utf-8')
                 
             self.logger.info(f"Saved article data to {filepath}")
             return str(filepath)
@@ -669,7 +683,7 @@ class AlJazeeraScraper:
             }
             
             # Insert article and get the generated ID
-            article_result = supabase.table("articles").upsert(article_record).execute()
+            article_result = await asyncio.to_thread(lambda: supabase.table("articles").upsert(article_record).execute())
             
             # Extract the generated article ID
             if article_result and article_result.data and len(article_result.data) > 0:
@@ -694,7 +708,7 @@ class AlJazeeraScraper:
                 
                 # Insert each batch of sentences
                 for batch in sentence_batches:
-                    sentences_result = supabase.table("sentences").upsert(batch).execute()
+                    sentences_result = await asyncio.to_thread(lambda: supabase.table("sentences").upsert(batch).execute())
                     
                     if sentences_result and sentences_result.data:
                         # Match the returned sentences with our original ones by position
@@ -727,18 +741,14 @@ class AlJazeeraScraper:
                     batch = [w for w in processed_words[i:i + batch_size] if "sentence_id" in w]  # Only include words with valid sentence_id
                     if batch:  # Only insert if there are valid words
                         try:
-                            words_result = supabase.table("word_with_ichkal").upsert(
-                                batch,
-                            ).execute()
+                            words_result = await asyncio.to_thread(lambda: supabase.table("word_with_ichkal").upsert(batch).execute())
                             self.logger.info(f"Stored {len(batch)} words in Supabase")
                         except Exception as word_error:
                             self.logger.warning(f"Error storing words batch: {str(word_error)}")
                             # Try inserting one by one to salvage what we can
                             for single_word in batch:
                                 try:
-                                    supabase.table("word_with_ichkal").upsert(
-                                        [single_word],
-                                    ).execute()
+                                    await asyncio.to_thread(lambda: supabase.table("word_with_ichkal").upsert([single_word]).execute())
                                 except Exception:
                                     # Skip this word if it fails
                                     pass
@@ -787,17 +797,16 @@ class AlJazeeraScraper:
                     else:
                         self.stats['articles_failed'] += 1
                         self.logger.warning(f"❌ Failed extraction: {url} - {article_data.get('error')}")
-                        
-                    # Add delay
-                    if self.request_delay > 0:
-                        await asyncio.sleep(self.request_delay + random.uniform(0, 1))
-                        
-                    return article_data
+                    processed = article_data
                 else:
                     self.stats['articles_failed'] += 1
                     error_msg = result.get('error') if result else 'Unknown error'
                     self.logger.warning(f"❌ Failed fetch: {url} - {error_msg}")
-                    return {'url': url, 'error': error_msg}
+                    processed = {'url': url, 'error': error_msg}
+            # Move optional politeness delay outside the semaphore so slots are not blocked
+            if self.request_delay > 0:
+                await asyncio.sleep(self.request_delay + random.uniform(0, 1))
+            return processed
         
         # Process all articles in batch
         tasks = [process_article(url) for url in article_urls]
@@ -980,4 +989,10 @@ async def main():
         sys.exit(1)
 
 if __name__ == "__main__":
+    # Use uvloop if available for faster event loop
+    try:
+        import uvloop  # type: ignore
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    except Exception:
+        pass
     asyncio.run(main())
