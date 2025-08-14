@@ -12,6 +12,7 @@ import random
 import time
 import re
 import uuid 
+from datetime import datetime, date, timezone
 from typing import List, Optional, Dict, Any, Set, Tuple
 from urllib.parse import urljoin, urlparse
 from dataclasses import dataclass
@@ -42,11 +43,11 @@ COLLAPSE_WS_RE = re.compile(r'\s+')
 WORD_SPLIT_RE = re.compile(r'\s+')
 PUNCT_EDGES_RE = re.compile(r'^[\W]+|[\W]+$')
 EN_NUM_RE = re.compile(r'[a-zA-Z0-9]')
+EN_LETTER_RE = re.compile(r'[a-zA-Z]')
 ARABIC_DIACRITICS_RE = re.compile(r'[\u064B-\u065F\u0670]')
 
-# Import TashkilUnified from tashkil package
+# Allow importing local packages (e.g., tashkil)
 sys.path.append(str(Path(__file__).parent.parent))
-from tashkil.tashkil_unified import TashkilUnified
 
 # Supabase client no longer used; we connect directly via CONNECTION_STRING
 
@@ -71,7 +72,7 @@ class AlJazeeraScraper:
         self.setup_session_config()
         self.setup_retry_config()
         
-        # Initialize direct DB access via ƒ (preferred)
+        # Initialize direct DB access via CONNECTION_STRING (preferred)
         self.connection_string: Optional[str] = os.environ.get("CONNECTION_STRING")
         self.db_pool = None
         if self.connection_string and asyncpg:
@@ -130,6 +131,55 @@ class AlJazeeraScraper:
         self.existing_article_urls: Set[str] = set()
         self.existing_article_slugs: Set[str] = set()
         
+    def parse_datetime_str(self, value: Any) -> Optional[datetime]:
+        """Parse various datetime/date string formats into timezone-aware datetime (UTC)."""
+        try:
+            if isinstance(value, datetime):
+                # Ensure tz-aware; assume UTC if naive
+                return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+            if isinstance(value, date):
+                return datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
+            if not isinstance(value, str):
+                return None
+            s = value.strip()
+            if not s:
+                return None
+            # Normalize Zulu suffix
+            if s.endswith('Z'):
+                s = s[:-1] + '+00:00'
+            # Try ISO8601 first
+            try:
+                dt = datetime.fromisoformat(s)
+                return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                pass
+            # Common fallbacks
+            fmts = [
+                '%Y-%m-%dT%H:%M:%S%z',
+                '%Y-%m-%dT%H:%M:%S.%f%z',
+                '%Y-%m-%d %H:%M:%S%z',
+                '%Y-%m-%d %H:%M:%S',
+                '%Y-%m-%d'
+            ]
+            for fmt in fmts:
+                try:
+                    dt = datetime.strptime(s, fmt)
+                    # If no tz info in format, assume UTC
+                    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+                except Exception:
+                    continue
+            return None
+        except Exception:
+            return None
+
+    def to_naive_utc(self, value: Optional[datetime]) -> Optional[datetime]:
+        """Convert datetime to naive UTC (drop tzinfo after converting to UTC)."""
+        if not isinstance(value, datetime):
+            return None
+        if value.tzinfo:
+            return value.astimezone(timezone.utc).replace(tzinfo=None)
+        return value
+
     def load_settings(self, settings_file: str):
         """Load configuration from settings.json file"""
         settings_path = Path(__file__).parent / settings_file
@@ -469,37 +519,37 @@ class AlJazeeraScraper:
     def clean_tashkil_output(self, text: str) -> str:
         """Clean up the tashkil output by removing AI instructions and XML tags"""
         # Remove any XML/HTML-like tags that might be in the response
-        text = re.sub(r'<task>.*?</task>', '', text, flags=re.DOTALL)
-        text = re.sub(r'<instructions>.*?</instructions>', '', text, flags=re.DOTALL)
-        text = re.sub(r'<article_input>.*?</article_input>', '', text, flags=re.DOTALL)
+        # text = re.sub(r'<task>.*?</task>', '', text, flags=re.DOTALL)
+        # text = re.sub(r'<instructions>.*?</instructions>', '', text, flags=re.DOTALL)
+        # text = re.sub(r'<article_input>.*?</article_input>', '', text, flags=re.DOTALL)
         
         # Remove any remaining XML/HTML tags
-        text = re.sub(r'<[^>]+>', '', text)
+        # text = re.sub(r'<[^>]+>', '', text)
         
-        # Remove lines that might contain AI instructions
-        lines_to_remove = [
-            "You are an expert in Arabic diacritization",
-            "Your task is to add accurate",
-            "Please follow these rules",
-            "Do not modify the words",
-            "Preserve the original structure",
-            "Add diacritics to every word",
-            "Here is the text with diacritics:",
-            "Text with diacritics:"
-        ]
+        # # Remove lines that might contain AI instructions
+        # lines_to_remove = [
+        #     "You are an expert in Arabic diacritization",
+        #     "Your task is to add accurate",
+        #     "Please follow these rules",
+        #     "Do not modify the words",
+        #     "Preserve the original structure",
+        #     "Add diacritics to every word",
+        #     "Here is the text with diacritics:",
+        #     "Text with diacritics:"
+        # ]
         
-        for line in lines_to_remove:
-            text = re.sub(r'.*' + re.escape(line) + r'.*\n?', '', text, flags=re.IGNORECASE)
+        # for line in lines_to_remove:
+        #     text = re.sub(r'.*' + re.escape(line) + r'.*\n?', '', text, flags=re.IGNORECASE)
         
-        # Clean up extra whitespace
-        text = COLLAPSE_WS_RE.sub(' ', text).strip()
+        # # Clean up extra whitespace
+        # text = COLLAPSE_WS_RE.sub(' ', text).strip()
         
         return text
         
     def filter_non_arabic(self, text: str) -> str:
-        """Filter out numbers and English letters from text"""
-        # Replace English letters and numbers with spaces
-        text = EN_NUM_RE.sub(' ', text)
+        """Filter out English letters from sentence text (preserve digits)"""
+        # Replace English letters with spaces, keep digits
+        text = EN_LETTER_RE.sub(' ', text)
         
         # Clean up extra whitespace created by replacements
         text = COLLAPSE_WS_RE.sub(' ', text).strip()
@@ -507,87 +557,91 @@ class AlJazeeraScraper:
         return text
     
     async def process_tashkil(self, text: str) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
-        """Process text through TashkilAI and prepare database records"""
-        # Process the entire article at once with TashkilAI
-        full_tashkil_text = ""
-        if self.tashkil_ai:
+        """Process text through TashkilAI and prepare database records.
+        Ensures 1:1 sentence alignment by falling back to per-sentence diacritization when needed.
+        """
+        async def tashkeel_once(input_text: str) -> str:
+            if not input_text:
+                return ""
+            if getattr(self, 'tashkil_method', '') == 'mishkal' and hasattr(self, '_tashkil_executor'):
+                loop = asyncio.get_running_loop()
+                async with self._tashkil_lock:
+                    def ensure_mishkal_and_tashkeel():
+                        if self.tashkil_ai is None:
+                            from tashkil.tashkil_unified import TashkilUnified as _TU  # type: ignore
+                            self.tashkil_ai = _TU(method="mishkal")
+                        return self.tashkil_ai.tashkeel(input_text)
+                    return await loop.run_in_executor(self._tashkil_executor, ensure_mishkal_and_tashkeel)
+            elif self.tashkil_ai:
+                return await asyncio.to_thread(self.tashkil_ai.tashkeel, input_text)
+            else:
+                return input_text
+
+        # 1) Split original into sentences
+        original_sentences = self.split_into_sentences(text)
+
+        # 2) Try full-article diacritization first
+        full_tashkil_text = text
+        tashkil_sentences: List[str] = []
+        if self.tashkil_ai or getattr(self, 'tashkil_method', '') == 'mishkal':
             try:
                 self.logger.info(f"Adding tashkil to full article ({len(text)} chars)...")
-                # Use a single-thread executor and lock for Mishkal to avoid SQLite thread/recursion errors
-                if getattr(self, 'tashkil_method', '') == 'mishkal' and hasattr(self, '_tashkil_executor'):
-                    loop = asyncio.get_running_loop()
-                    async with self._tashkil_lock:
-                        def ensure_mishkal_and_tashkeel():
-                            # Initialize Mishkal inside the executor thread on first use
-                            if self.tashkil_ai is None:
-                                try:
-                                    # Import inside thread to bind any thread-local resources
-                                    from tashkil.tashkil_unified import TashkilUnified as _TU  # type: ignore
-                                    self.tashkil_ai = _TU(method="mishkal")
-                                except Exception as ee:
-                                    raise ee
-                            return self.tashkil_ai.tashkeel(text)
-                        raw_tashkil_output = await loop.run_in_executor(self._tashkil_executor, ensure_mishkal_and_tashkeel)
-                else:
-                    raw_tashkil_output = await asyncio.to_thread(self.tashkil_ai.tashkeel, text)
-                # Clean up the output to remove any AI instructions
+                #raw_tashkil_output = await tashkeel_once(text)
+                raw_tashkil_output = ""
                 full_tashkil_text = self.clean_tashkil_output(raw_tashkil_output)
-                self.logger.info(f"Successfully added tashkil to full article")
+                tashkil_sentences = self.split_into_sentences(full_tashkil_text)
             except Exception as e:
                 self.logger.error(f"Error adding tashkil to full article: {str(e)}")
-                full_tashkil_text = text  # Fallback to original
+                full_tashkil_text = text
+                tashkil_sentences = []
         else:
-            full_tashkil_text = text  # No TashkilAI available
-            
-        # Note: We don't filter the full article text here to preserve it for JSON storage
-        # Filtering will be applied to individual sentences
-            
-        # Split original and tashkil text into sentences
-        original_sentences = self.split_into_sentences(text)
-        tashkil_sentences = self.split_into_sentences(full_tashkil_text)
-        
-        # Make sure we have the same number of sentences
-        # If not, fall back to original sentences
-        if len(original_sentences) != len(tashkil_sentences):
-            self.logger.warning(f"Sentence count mismatch: original={len(original_sentences)}, tashkil={len(tashkil_sentences)}")
-            
+            full_tashkil_text = text
+            tashkil_sentences = []
+
+        # 3) If sentence counts mismatch, fall back to per-sentence diacritization to guarantee alignment
+        if len(original_sentences) != len(tashkil_sentences) or not tashkil_sentences:
+            if self.tashkil_ai or getattr(self, 'tashkil_method', '') == 'mishkal':
+                self.logger.warning(
+                    f"Sentence count mismatch (orig={len(original_sentences)} vs tash={len(tashkil_sentences)}). Falling back to per-sentence."
+                )
+                tashkil_sentences = []
+                for s in original_sentences:
+                    try:
+                        raw = await tashkeel_once(s)
+                        tashkil_sentences.append(self.clean_tashkil_output(raw))
+                    except Exception:
+                        # If diacritization fails for a sentence, keep the original to preserve alignment
+                        tashkil_sentences.append(s)
+                full_tashkil_text = " ".join(tashkil_sentences)
+            else:
+                # No tashkil engine configured; mirror original to maintain alignment
+                tashkil_sentences = list(original_sentences)
+                full_tashkil_text = text
+
+        # 4) Build records
         self.stats['sentences_processed'] += len(original_sentences)
-        
-        # Process sentences and words
-        sentence_records = []
-        word_records = []
-        
-        # Process each sentence
+        sentence_records: List[Dict[str, Any]] = []
+        word_records: List[Dict[str, Any]] = []
+
         for i, (original_sentence, tashkil_sentence) in enumerate(zip(original_sentences, tashkil_sentences)):
-            # Use index as temporary ID for reference
-            temp_sentence_id = str(i)  # We'll let Supabase generate the real IDs
-            
-            # Filter out non-Arabic characters from sentences
+            temp_sentence_id = str(i)
             filtered_original = self.filter_non_arabic(original_sentence)
             filtered_tashkil = self.filter_non_arabic(tashkil_sentence)
-            
-            # Create sentence record (without article_id, will be set later)
             sentence_records.append({
-                "id": temp_sentence_id,  # Temporary ID for reference
+                "id": temp_sentence_id,
                 "text": filtered_original,
                 "tashkil": filtered_tashkil
             })
-            
-            # Process words in the sentence with tashkil
             words_with_tashkil = self.extract_words(tashkil_sentence)
             self.stats['words_processed'] += len(words_with_tashkil)
-            
             for word_with_tashkil in words_with_tashkil:
-                # Extract word without tashkil
                 word_without_tashkil = self.extract_word_without_tashkil(word_with_tashkil)
-                
-                # Create word record (without real sentence_id, will be set later)
                 word_records.append({
                     "word": word_with_tashkil,
                     "word_without_ichkal": word_without_tashkil,
-                    "sentence_id": temp_sentence_id  # Temporary ID for reference
+                    "sentence_id": temp_sentence_id
                 })
-        
+
         return full_tashkil_text, sentence_records, word_records
     
     def extract_article_data(self, html_content: str, url: str) -> Dict[str, Any]:
@@ -602,7 +656,7 @@ class AlJazeeraScraper:
             title_elem = soup.select_one('#main-content-area > header > h1')
             title = title_elem.get_text().strip() if title_elem else ""
             
-            # Extract topics/tags
+            # Extract topics/tags (primary UI chips)
             topic_elems = soup.select('#main-content-area > header > div > div > a')
             topics = [elem.get_text().strip() for elem in topic_elems]
             
@@ -631,12 +685,32 @@ class AlJazeeraScraper:
             
             # Extract metadata
             meta_elems = soup.select('head > meta')
-            metadata = {}
+            metadata: Dict[str, Any] = {}
             for meta in meta_elems:
-                name = meta.get('name') or meta.get('property')
+                key = meta.get('name') or meta.get('property') or meta.get('itemprop')
                 content = meta.get('content')
-                if name and content:
-                    metadata[name] = content
+                if key and content:
+                    # Aggregate duplicates as list (e.g., multiple article:tag entries)
+                    existing = metadata.get(key)
+                    if existing is None:
+                        metadata[key] = content
+                    elif isinstance(existing, list):
+                        existing.append(content)
+                    else:
+                        metadata[key] = [existing, content]
+
+            # Include JSON-LD blocks under metadata["jsonld"]
+            jsonld_blocks = []
+            for script in soup.select('script[type="application/ld+json"]'):
+                try:
+                    # Some sites include multiple JSON objects in a single script tag
+                    parsed = json.loads(script.string or "{}")
+                    jsonld_blocks.append(parsed)
+                except Exception:
+                    # Ignore malformed JSON-LD
+                    continue
+            if jsonld_blocks:
+                metadata["jsonld"] = jsonld_blocks if len(jsonld_blocks) > 1 else jsonld_blocks[0]
             
             # Clean content text
             content_text = self.clean_html_content(' '.join(article_paragraphs_html))
@@ -649,8 +723,72 @@ class AlJazeeraScraper:
             parsed_url = urlparse(url)
             slug = parsed_url.path.strip('/').split('/')[-1]
             
-            # Extract published date from metadata
-            published_at = metadata.get('article:published_time', None)
+            # Extract published date from metadata (with fallbacks)
+            published_at_raw = metadata.get('article:published_time') or metadata.get('og:published_time')
+            if not published_at_raw:
+                try:
+                    # Try JSON-LD datePublished
+                    jsonld_source = metadata.get('jsonld')
+                    jsonld_candidates = jsonld_source if isinstance(jsonld_source, list) else [jsonld_source] if jsonld_source else []
+                    for block in jsonld_candidates:
+                        if isinstance(block, dict):
+                            published_at_raw = block.get('datePublished') or block.get('dateCreated') or block.get('uploadDate')
+                            if published_at_raw:
+                                break
+                except Exception:
+                    pass
+            published_at_dt = self.to_naive_utc(self.parse_datetime_str(published_at_raw))
+
+            # Fallback topics from metadata (e.g., multiple article:tag)
+            if not topics:
+                meta_tags = metadata.get('article:tag')
+                if isinstance(meta_tags, list):
+                    topics = [t.strip() for t in meta_tags if isinstance(t, str)]
+                elif isinstance(meta_tags, str):
+                    topics = [meta_tags.strip()]
+
+            # Derive categories from multiple sources: meta, breadcrumbs, URL
+            categories_set: Set[str] = set()
+            # 1) Meta-based sections
+            for key in ['article:section', 'og:section', 'section', 'article:category']:
+                val = metadata.get(key)
+                if isinstance(val, list):
+                    for v in val:
+                        if isinstance(v, str) and v.strip():
+                            categories_set.add(v.strip())
+                elif isinstance(val, str) and val.strip():
+                    categories_set.add(val.strip())
+
+            # 2) Breadcrumbs
+            breadcrumb_selectors = [
+                'nav[aria-label="breadcrumb"] a',
+                'nav.breadcrumb a',
+                'ol.breadcrumb li a',
+                '.o-breadcrumb__list a',
+                '.c-breadcrumb a',
+                '#main-content-area nav a'
+            ]
+            for sel in breadcrumb_selectors:
+                try:
+                    for a in soup.select(sel):
+                        text = (a.get_text() or '').strip()
+                        if text and text not in {'Home', 'الرئيسية', 'الصفحة الرئيسية'}:
+                            categories_set.add(text)
+                except Exception:
+                    continue
+
+            # 3) URL-based inference (first 1-2 segments excluding slug)
+            try:
+                parsed_url = urlparse(url)
+                path_parts = [p for p in parsed_url.path.strip('/').split('/') if p]
+                if len(path_parts) >= 2:
+                    # Exclude last part (slug)
+                    inferred = path_parts[:-1][:2]
+                    for seg in inferred:
+                        if seg and not seg.isdigit():
+                            categories_set.add(seg)
+            except Exception:
+                pass
             
             # Extract image URLs (already processed with full URLs)
             image_urls = [img['url'] for img in images if img['url']]
@@ -665,9 +803,9 @@ class AlJazeeraScraper:
                 'image_urls': image_urls,
                 'metadata': metadata,
                 'slug': slug,
-                'published_at': published_at,
+                'published_at': published_at_dt,
                 'tags': topics,  # Using topics as tags
-                'categories': [],  # No specific category extraction
+                'categories': list(categories_set),
                 'content_length': len(content_text)
                 # Let Supabase generate the ID
             }
