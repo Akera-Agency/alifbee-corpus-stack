@@ -17,6 +17,7 @@ from urllib.parse import urljoin, urlparse
 from dataclasses import dataclass
 from pathlib import Path
 from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor
 
 # Load environment variables from .env file if it exists
 load_dotenv()
@@ -24,6 +25,7 @@ load_dotenv()
 import aiohttp
 import xmltodict
 from bs4 import BeautifulSoup
+import asyncpg  # type: ignore
 
 sys.path.append(os.path.abspath('/Users/macmini/elysia-starter/alifbee/alifbee-corpus-stack/packages/al-jazeera-scrapper'))
 
@@ -46,12 +48,7 @@ ARABIC_DIACRITICS_RE = re.compile(r'[\u064B-\u065F\u0670]')
 sys.path.append(str(Path(__file__).parent.parent))
 from tashkil.tashkil_unified import TashkilUnified
 
-from supabase import create_client, Client
-
-# Initialize Supabase client - will be set up in __init__ if environment variables are present
-url: str = os.environ.get("SUPABASE_URL")
-key: str = os.environ.get("SUPABASE_KEY")
-supabase: Client = None  # Will be initialized in the class if URL and key are available
+# Supabase client no longer used; we connect directly via CONNECTION_STRING
 
 @dataclass 
 class RetryConfig:
@@ -74,41 +71,35 @@ class AlJazeeraScraper:
         self.setup_session_config()
         self.setup_retry_config()
         
-        # Initialize Supabase
-        global supabase
-        if url and key:
-            try:
-                supabase = create_client(url, key)
-                self.logger.info("Supabase client initialized successfully")
-                self.supabase_enabled = os.environ.get("SUPABASE_WRITE", "1") == "1"
-                if not self.supabase_enabled:
-                    self.logger.info("Supabase writes disabled via SUPABASE_WRITE=0")
-            except Exception as e:
-                self.logger.error(f"Failed to initialize Supabase client: {str(e)}")
-                self.supabase_enabled = False
+        # Initialize direct DB access via ƒ (preferred)
+        self.connection_string: Optional[str] = os.environ.get("CONNECTION_STRING")
+        self.db_pool = None
+        if self.connection_string and asyncpg:
+            # Defer actual pool creation to first use to avoid blocking __init__
+            self.db_enabled = True
+            self.logger.info("Database writes enabled via CONNECTION_STRING")
         else:
-            self.logger.warning("SUPABASE_URL or SUPABASE_KEY not found. Database storage will be disabled.")
-            self.supabase_enabled = False
+            self.db_enabled = False
+            if not self.connection_string:
+                self.logger.warning("CONNECTION_STRING not found. Database storage will be disabled.")
+            elif not asyncpg:
+                self.logger.error("asyncpg is not installed; cannot use CONNECTION_STRING. Database storage disabled.")
         
         # Initialize TashkilUnified
         api_key = os.environ.get("GEMINI_API_KEY")
         tashkil_method = os.environ.get("TASHKIL_METHOD", "mishkal").lower()
+        self.tashkil_method = tashkil_method
         
         if os.environ.get("TASHKIL_ENABLED", "1") != "1":
             self.tashkil_ai = None
             self.logger.info("Tashkil disabled via TASHKIL_ENABLED=0")
         elif tashkil_method == "mishkal":
-            try:
-                self.tashkil_ai = TashkilUnified(method="mishkal")
-                self.logger.info("Initialized TashkilUnified with Mishkal method")
-            except Exception as e:
-                self.logger.warning(f"Failed to initialize Mishkal: {str(e)}. Falling back to Gemini.")
-                if api_key:
-                    self.tashkil_ai = TashkilUnified(method="gemini", api_key=api_key)
-                    self.logger.info("Initialized TashkilUnified with Gemini method (fallback)")
-                else:
-                    self.logger.warning("GEMINI_API_KEY not found. Tashkil functionality will be disabled.")
-                    self.tashkil_ai = None
+            # For Mishkal, defer initialization to a dedicated single thread to keep SQLite on one thread
+            self.tashkil_ai = None
+            self._tashkil_executor: Optional[ThreadPoolExecutor] = ThreadPoolExecutor(max_workers=1)
+            self._tashkil_lock: asyncio.Lock = asyncio.Lock()
+            self._tashkil_ai_thread = None  # Will be created inside executor thread on first use
+            self.logger.info("Mishkal will be initialized lazily in a dedicated thread for thread-safety")
         elif tashkil_method == "gemini":
             if not api_key:
                 self.logger.warning("GEMINI_API_KEY not found. Tashkil functionality will be disabled.")
@@ -131,8 +122,13 @@ class AlJazeeraScraper:
             'articles_scraped': 0,
             'articles_failed': 0,
             'sentences_processed': 0,
-            'words_processed': 0
+            'words_processed': 0,
+            'articles_skipped': 0
         }
+
+        # Track existing articles to avoid re-scraping (filled from Supabase once)
+        self.existing_article_urls: Set[str] = set()
+        self.existing_article_slugs: Set[str] = set()
         
     def load_settings(self, settings_file: str):
         """Load configuration from settings.json file"""
@@ -285,6 +281,50 @@ class AlJazeeraScraper:
             backoff_factor=self.retry_settings["backoff_factor"],
             retry_statuses=set(self.retry_settings["retry_statuses"])
         )
+
+    def get_slug_from_url(self, url: str) -> str:
+        """Generate slug from article URL to match DB slug logic"""
+        try:
+            parsed_url = urlparse(url)
+            return parsed_url.path.strip('/').split('/')[-1]
+        except Exception:
+            return ""
+
+    async def load_existing_articles(self) -> None:
+        """Load existing article URLs/slugs from Supabase once to skip duplicates"""
+        if not self.db_enabled:
+            self.logger.info("DB disabled; skipping existing articles prefetch")
+            return
+        try:
+            self.logger.info("Fetching existing articles from DB (single query)...")
+            pool = await self.get_db_pool()
+            if not pool:
+                return
+            async with pool.acquire() as conn:
+                rows = await conn.fetch("SELECT url, slug FROM articles")
+                for row in rows:
+                    url_val = row.get("url") if isinstance(row, dict) else row["url"]
+                    slug_val = row.get("slug") if isinstance(row, dict) else row["slug"]
+                    if url_val:
+                        self.existing_article_urls.add(url_val)
+                    if slug_val:
+                        self.existing_article_slugs.add(slug_val)
+            self.logger.info(f"Loaded {len(self.existing_article_urls)} existing article URLs and {len(self.existing_article_slugs)} slugs")
+        except Exception as e:
+            self.logger.warning(f"Failed to fetch existing articles: {str(e)}")
+
+    async def get_db_pool(self):
+        """Lazily create and return an asyncpg pool."""
+        if not self.db_enabled:
+            return None
+        if self.db_pool is None:
+            try:
+                self.db_pool = await asyncpg.create_pool(self.connection_string, min_size=1, max_size=5)
+            except Exception as e:
+                self.logger.error(f"Failed to create DB pool: {str(e)}")
+                self.db_enabled = False
+                return None
+        return self.db_pool
         
     async def fetch_with_retry(self, session: aiohttp.ClientSession, url: str) -> Optional[Dict[str, Any]]:
         """Fetch URL with retry logic (proxy handles rotation automatically)"""
@@ -473,7 +513,23 @@ class AlJazeeraScraper:
         if self.tashkil_ai:
             try:
                 self.logger.info(f"Adding tashkil to full article ({len(text)} chars)...")
-                raw_tashkil_output = await asyncio.to_thread(self.tashkil_ai.tashkeel, text)
+                # Use a single-thread executor and lock for Mishkal to avoid SQLite thread/recursion errors
+                if getattr(self, 'tashkil_method', '') == 'mishkal' and hasattr(self, '_tashkil_executor'):
+                    loop = asyncio.get_running_loop()
+                    async with self._tashkil_lock:
+                        def ensure_mishkal_and_tashkeel():
+                            # Initialize Mishkal inside the executor thread on first use
+                            if self.tashkil_ai is None:
+                                try:
+                                    # Import inside thread to bind any thread-local resources
+                                    from tashkil.tashkil_unified import TashkilUnified as _TU  # type: ignore
+                                    self.tashkil_ai = _TU(method="mishkal")
+                                except Exception as ee:
+                                    raise ee
+                            return self.tashkil_ai.tashkeel(text)
+                        raw_tashkil_output = await loop.run_in_executor(self._tashkil_executor, ensure_mishkal_and_tashkeel)
+                else:
+                    raw_tashkil_output = await asyncio.to_thread(self.tashkil_ai.tashkeel, text)
                 # Clean up the output to remove any AI instructions
                 full_tashkil_text = self.clean_tashkil_output(raw_tashkil_output)
                 self.logger.info(f"Successfully added tashkil to full article")
@@ -622,8 +678,11 @@ class AlJazeeraScraper:
             
     async def save_to_json(self, article_data: Dict[str, Any], sentences: List[Dict[str, Any]], words: List[Dict[str, Any]]) -> str:
         """Save article data, sentences, and words to a JSON file in the data directory"""
+        # File writing disabled for now
+        self.logger.info("File writing disabled; skipping JSON save")
+        """
         try:
-            # Create a complete data structure
+            # Original file-writing logic (disabled)
             complete_data = {
                 "article": {
                     "url": article_data["url"],
@@ -640,126 +699,117 @@ class AlJazeeraScraper:
                 "sentences": sentences,
                 "words": words
             }
-            
-            # Create data directory if it doesn't exist
             data_dir = Path("data")
             data_dir.mkdir(exist_ok=True)
-            
-            # Create filename based on slug and timestamp
             timestamp = int(time.time())
             filename = f"article_{article_data['slug']}_{timestamp}.json"
             filepath = data_dir / filename
-            
-            # Serialize and write without blocking the event loop
             json_str = json.dumps(complete_data, indent=2, ensure_ascii=False)
             await asyncio.to_thread(filepath.write_text, json_str, 'utf-8')
-                
             self.logger.info(f"Saved article data to {filepath}")
             return str(filepath)
-            
         except Exception as e:
             self.logger.error(f"Failed to save article data to JSON: {str(e)}")
             return ""
+        """
+        return ""
     
     async def store_in_supabase(self, article_data: Dict[str, Any], sentences: List[Dict[str, Any]], words: List[Dict[str, Any]]) -> bool:
-        """Store article data, sentences, and words in Supabase"""
-        if not self.supabase_enabled or not supabase:
-            self.logger.warning("Supabase storage is disabled. Skipping database storage.")
+        """Store article data, sentences, and words using direct Postgres connection (CONNECTION_STRING)."""
+        if not self.db_enabled:
+            self.logger.warning("Database storage is disabled. Skipping database storage.")
             return False
-            
         try:
-            # Store article (let Supabase generate the ID)
-            article_record = {
-                "url": article_data["url"],
-                "title": article_data["title"],
-                "metadata": article_data["metadata"],
-                "slug": article_data["slug"],
-                "published_at": article_data["published_at"],
-                "tags": article_data["tags"],
-                "categories": article_data["categories"],
-                "image_urls": article_data["image_urls"],
-                "content": article_data["content"],
-                "tashkil": article_data.get("tashkil", "")
-            }
-            
-            # Insert article and get the generated ID
-            article_result = await asyncio.to_thread(lambda: supabase.table("articles").upsert(article_record).execute())
-            
-            # Extract the generated article ID
-            if article_result and article_result.data and len(article_result.data) > 0:
-                article_id = article_result.data[0].get('id')
-                self.logger.info(f"Stored article in Supabase with ID {article_id}: {article_data['title'][:30]}...")
-                
-                # Create a mapping from temp IDs to sentences
-                temp_id_to_sentence = {}
+            pool = await self.get_db_pool()
+            if not pool:
+                return False
+            async with pool.acquire() as conn:
+                # Store or update article, then get id
+                # Normalize complex types. If DB columns are arrays/jsonb, use native types; else JSON-encode.
+                metadata_val = article_data.get("metadata")
+                tags_val = article_data.get("tags")
+                categories_val = article_data.get("categories")
+                image_urls_val = article_data.get("image_urls")
+                # Detect if connection expects arrays for tags/categories/image_urls by trying to use them as arrays.
+                # We will pass lists directly; if DB expects text, it will error and be caught.
+                article_record = {
+                    "url": article_data["url"],
+                    "title": article_data["title"],
+                    "metadata": metadata_val if isinstance(metadata_val, (dict, list)) else metadata_val,
+                    "slug": article_data["slug"],
+                    "published_at": article_data["published_at"],
+                    "tags": tags_val if isinstance(tags_val, list) else ([] if tags_val is None else [str(tags_val)]),
+                    "categories": categories_val if isinstance(categories_val, list) else ([] if categories_val is None else [str(categories_val)]),
+                    "image_urls": image_urls_val if isinstance(image_urls_val, list) else ([] if image_urls_val is None else [str(image_urls_val)]),
+                    "content": article_data["content"],
+                    "tashkil": article_data.get("tashkil", "")
+                }
+                existing = await conn.fetchrow("SELECT id FROM articles WHERE url = $1", article_record["url"])
+                if existing:
+                    article_id = existing["id"]
+                    # Use explicit casts to jsonb/array where appropriate
+                    await conn.execute(
+                        "UPDATE articles SET title=$2, metadata=$3::jsonb, slug=$4, published_at=$5, tags=$6::text[], categories=$7::text[], image_urls=$8::text[], content=$9, tashkil=$10 WHERE id=$1",
+                        article_id,
+                        article_record["title"],
+                        json.dumps(article_record["metadata"], ensure_ascii=False) if isinstance(article_record["metadata"], (dict, list)) else article_record["metadata"],
+                        article_record["slug"],
+                        article_record["published_at"],
+                        article_record["tags"],
+                        article_record["categories"],
+                        article_record["image_urls"],
+                        article_record["content"],
+                        article_record["tashkil"],
+                    )
+                else:
+                    article_id = await conn.fetchval(
+                        "INSERT INTO articles (url,title,metadata,slug,published_at,tags,categories,image_urls,content,tashkil) VALUES ($1,$2,$3::jsonb,$4,$5,$6::text[],$7::text[],$8::text[],$9,$10) RETURNING id",
+                        article_record["url"],
+                        article_record["title"],
+                        json.dumps(article_record["metadata"], ensure_ascii=False) if isinstance(article_record["metadata"], (dict, list)) else article_record["metadata"],
+                        article_record["slug"],
+                        article_record["published_at"],
+                        article_record["tags"],
+                        article_record["categories"],
+                        article_record["image_urls"],
+                        article_record["content"],
+                        article_record["tashkil"],
+                    )
+                self.logger.info(f"Stored article with ID {article_id}: {article_data['title'][:30]}...")
+
+                # Insert sentences and collect their IDs
+                sentence_id_map: Dict[str, Any] = {}
                 for sentence in sentences:
-                    temp_id = sentence.pop("id", None)  # Remove our temporary ID
-                    sentence["article_id"] = article_id  # Set the actual article ID
-                    temp_id_to_sentence[temp_id] = sentence
-                
-                # Insert sentences in batches
-                batch_size = 50
-                sentence_batches = []
-                for i in range(0, len(sentences), batch_size):
-                    sentence_batches.append(sentences[i:i + batch_size])
-                
-                # Track inserted sentences and their IDs
-                sentence_id_map = {}  # Maps temp_id to real UUID
-                
-                # Insert each batch of sentences
-                for batch in sentence_batches:
-                    sentences_result = await asyncio.to_thread(lambda: supabase.table("sentences").upsert(batch).execute())
-                    
-                    if sentences_result and sentences_result.data:
-                        # Match the returned sentences with our original ones by position
-                        for i, sentence_record in enumerate(sentences_result.data):
-                            if i < len(batch):
-                                # Find the temp_id for this sentence
-                                for temp_id, sent in temp_id_to_sentence.items():
-                                    if sent is batch[i]:  # Compare by reference
-                                        sentence_id_map[temp_id] = sentence_record.get('id')
-                                        break
-                    
-                    self.logger.info(f"Stored {len(batch)} sentences in Supabase")
-                
-                # Update word records with real sentence IDs and save all words (including duplicates)
+                    temp_id = sentence.pop("id", None)
+                    sid = await conn.fetchval(
+                        "INSERT INTO sentences (article_id, text, tashkil) VALUES ($1,$2,$3) RETURNING id",
+                        article_id,
+                        sentence["text"],
+                        sentence["tashkil"],
+                    )
+                    if temp_id is not None:
+                        sentence_id_map[temp_id] = sid
+                self.logger.info(f"Stored {len(sentences)} sentences")
+
+                # Prepare and insert words
                 processed_words = []
                 for word in words:
                     temp_sentence_id = word.pop("sentence_id", None)
                     if temp_sentence_id in sentence_id_map:
-                        word["sentence_id"] = sentence_id_map[temp_sentence_id]
-                        
-                        # Generate a unique ID for each word instance (including duplicates)
-                        word["id"] = self.generate_word_id(word["word"] + str(len(processed_words)))
-                        
-                        processed_words.append(word)
-                
-                self.logger.info(f"Processing {len(processed_words)} words (including duplicates)")
-                
-                # Insert words in batches
-                for i in range(0, len(processed_words), batch_size):
-                    batch = [w for w in processed_words[i:i + batch_size] if "sentence_id" in w]  # Only include words with valid sentence_id
-                    if batch:  # Only insert if there are valid words
-                        try:
-                            words_result = await asyncio.to_thread(lambda: supabase.table("word_with_ichkal").upsert(batch).execute())
-                            self.logger.info(f"Stored {len(batch)} words in Supabase")
-                        except Exception as word_error:
-                            self.logger.warning(f"Error storing words batch: {str(word_error)}")
-                            # Try inserting one by one to salvage what we can
-                            for single_word in batch:
-                                try:
-                                    await asyncio.to_thread(lambda: supabase.table("word_with_ichkal").upsert([single_word]).execute())
-                                except Exception:
-                                    # Skip this word if it fails
-                                    pass
-                
+                        sentence_id = sentence_id_map[temp_sentence_id]
+                        w_id = self.generate_word_id(word["word"] + str(len(processed_words)))
+                        processed_words.append((w_id, word["word"], word["word_without_ichkal"], sentence_id))
+
+                if processed_words:
+                    await conn.executemany(
+                        "INSERT INTO word_with_ichkal (id, word, word_without_ichkal, sentence_id) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING",
+                        processed_words,
+                    )
+                    self.logger.info(f"Stored {len(processed_words)} words")
+
                 return True
-            else:
-                self.logger.error("Failed to get article ID from Supabase response")
-                return False
-            
         except Exception as e:
-            self.logger.error(f"Failed to store data in Supabase: {str(e)}")
+            self.logger.error(f"Failed to store data in database: {str(e)}")
             return False
     
     async def scrape_article_batch(self, session: aiohttp.ClientSession, article_urls: List[str]) -> List[Dict[str, Any]]:
@@ -768,6 +818,21 @@ class AlJazeeraScraper:
         
         async def process_article(url):
             async with semaphore:
+                # Deduplicate: skip if already present in Supabase or seen in this run
+                slug = self.get_slug_from_url(url)
+                if url in self.existing_article_urls or (slug and slug in self.existing_article_slugs):
+                    self.stats['articles_skipped'] += 1
+                    self.logger.info(f"⏭️ Skipping already-scraped article: {url}")
+                    processed = {'url': url, 'skipped': True}
+                    # Move optional delay outside the semaphore
+                    if self.request_delay > 0:
+                        await asyncio.sleep(self.request_delay + random.uniform(0, 1))
+                    return processed
+                else:
+                    # Reserve this URL/slug to avoid duplicate processing within the same run
+                    self.existing_article_urls.add(url)
+                    if slug:
+                        self.existing_article_slugs.add(slug)
                 # Fetch article HTML
                 result = await self.fetch_with_retry(session, url)
                 
@@ -785,12 +850,8 @@ class AlJazeeraScraper:
                             tashkil_text, sentences, words = await self.process_tashkil(article_data['content'])
                             article_data['tashkil'] = tashkil_text
                             
-                            # First save to JSON file
-                            json_file = await self.save_to_json(article_data, sentences, words)
-                            
-                            # Then store in Supabase if JSON save was successful
-                            if json_file:
-                                await self.store_in_supabase(article_data, sentences, words)
+                            # Store in Supabase (file saving disabled)
+                            await self.store_in_supabase(article_data, sentences, words)
                             
                         except Exception as e:
                             self.logger.error(f"Error processing tashkil: {str(e)}")
@@ -830,6 +891,8 @@ class AlJazeeraScraper:
         
         # Step 1: Get main sitemap
         self.logger.info("🚀 Starting Al Jazeera scraping workflow")
+        # Prefetch existing articles once to enable skipping already-scraped items
+        await self.load_existing_articles()
         main_sitemap = await self.fetch_main_sitemap()
         
         if not main_sitemap:
@@ -875,7 +938,7 @@ class AlJazeeraScraper:
                     
         # Final stats
         elapsed = time.time() - start_time
-        successful_articles = [a for a in all_articles if not a.get('error')]
+        successful_articles = [a for a in all_articles if not a.get('error') and not a.get('skipped')]
         
         results = {
             'success': True,
@@ -896,11 +959,10 @@ class AlJazeeraScraper:
 # CLI interface matching n8n workflow
 async def main():
     # Check for environment variables (warning only, not required)
-    if not url or not key:
-        print("\n\033[93mWarning: SUPABASE_URL and/or SUPABASE_KEY environment variables are not set.\033[0m")
+    if not os.environ.get("CONNECTION_STRING"):
+        print("\n\033[93mWarning: CONNECTION_STRING environment variable is not set.\033[0m")
         print("Database storage will be disabled. To enable it, set:")
-        print("  export SUPABASE_URL=your_supabase_url")
-        print("  export SUPABASE_KEY=your_supabase_key")
+        print("  export CONNECTION_STRING=postgresql://USER:PASSWORD@HOST:PORT/DB?sslmode=require")
         
     # Check for tashkil configuration
     tashkil_method = os.environ.get("TASHKIL_METHOD", "gemini").lower()
@@ -951,24 +1013,23 @@ async def main():
         print(f"Articles found: {stats['articles_found']}")
         print(f"Articles scraped: {stats['successful_articles']}/{stats['total_articles']}")
         print(f"Failed articles: {stats['failed_articles']}")
+        print(f"Articles skipped (already scraped): {stats.get('articles_skipped', 0)}")
         print(f"Sentences processed: {stats.get('sentences_processed', 0)}")
         print(f"Words processed: {stats.get('words_processed', 0)}")
         print(f"Processing time: {stats['processing_time']:.1f}s")
         print(f"Speed: {stats['articles_per_second']:.2f} articles/second")
         
+        """
+        File writing disabled below. Keeping logic commented for future use.
         # Create data directory if it doesn't exist
         data_dir = Path("data")
         data_dir.mkdir(exist_ok=True)
-        
         # Save results to file
         timestamp = int(time.time())
         output_file = data_dir / f"aljazeera_articles_{timestamp}.json"
-        
         with open(output_file, 'w', encoding='utf-8') as f:
             json.dump(results, f, indent=2, ensure_ascii=False)
-        
         print(f"\n💾 Results saved to: {output_file}")
-        
         # Save just successful articles to separate file
         successful_articles = [a for a in results['articles'] if not a.get('error')]
         if successful_articles:
@@ -976,6 +1037,7 @@ async def main():
             with open(clean_file, 'w', encoding='utf-8') as f:
                 json.dump(successful_articles, f, indent=2, ensure_ascii=False)
             print(f"💾 Clean articles saved to: {clean_file}")
+        """
             
         print(f"\n💾 Data stored in Supabase database according to schema")
         
