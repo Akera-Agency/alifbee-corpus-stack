@@ -712,6 +712,37 @@ class AlJazeeraScraper:
             if jsonld_blocks:
                 metadata["jsonld"] = jsonld_blocks if len(jsonld_blocks) > 1 else jsonld_blocks[0]
             
+            # Title fallbacks from metadata/JSON-LD/<title>
+            if not title:
+                title_candidates: List[str] = []
+                for k in [
+                    'og:title', 'twitter:title', 'title', 'pageTitle'
+                ]:
+                    v = metadata.get(k)
+                    if isinstance(v, list):
+                        title_candidates.extend([x for x in v if isinstance(x, str) and x.strip()])
+                    elif isinstance(v, str) and v.strip():
+                        title_candidates.append(v)
+                # JSON-LD headline
+                try:
+                    jsonld_source = metadata.get('jsonld')
+                    jsonld_candidates = jsonld_source if isinstance(jsonld_source, list) else [jsonld_source] if jsonld_source else []
+                    for block in jsonld_candidates:
+                        if isinstance(block, dict):
+                            hl = block.get('headline')
+                            if isinstance(hl, str) and hl.strip():
+                                title_candidates.append(hl)
+                except Exception:
+                    pass
+                if not title_candidates:
+                    try:
+                        if soup.title and soup.title.string:
+                            title_candidates.append(soup.title.string.strip())
+                    except Exception:
+                        pass
+                if title_candidates:
+                    title = title_candidates[0]
+
             # Clean content text
             content_text = self.clean_html_content(' '.join(article_paragraphs_html))
             
@@ -723,8 +754,13 @@ class AlJazeeraScraper:
             parsed_url = urlparse(url)
             slug = parsed_url.path.strip('/').split('/')[-1]
             
-            # Extract published date from metadata (with fallbacks)
-            published_at_raw = metadata.get('article:published_time') or metadata.get('og:published_time')
+            # Extract published date from metadata (with broader fallbacks)
+            published_at_raw = (
+                metadata.get('article:published_time')
+                or metadata.get('og:published_time')
+                or metadata.get('publishedDate')
+                or metadata.get('datePublished')
+            )
             if not published_at_raw:
                 try:
                     # Try JSON-LD datePublished
@@ -732,32 +768,48 @@ class AlJazeeraScraper:
                     jsonld_candidates = jsonld_source if isinstance(jsonld_source, list) else [jsonld_source] if jsonld_source else []
                     for block in jsonld_candidates:
                         if isinstance(block, dict):
-                            published_at_raw = block.get('datePublished') or block.get('dateCreated') or block.get('uploadDate')
+                            published_at_raw = (
+                                block.get('datePublished')
+                                or block.get('dateCreated')
+                                or block.get('uploadDate')
+                            )
                             if published_at_raw:
                                 break
                 except Exception:
                     pass
             published_at_dt = self.to_naive_utc(self.parse_datetime_str(published_at_raw))
 
-            # Fallback topics from metadata (e.g., multiple article:tag)
+            # Fallback topics from metadata (e.g., multiple article:tag, topics, tags)
             if not topics:
-                meta_tags = metadata.get('article:tag')
-                if isinstance(meta_tags, list):
-                    topics = [t.strip() for t in meta_tags if isinstance(t, str)]
-                elif isinstance(meta_tags, str):
-                    topics = [meta_tags.strip()]
+                topics_collected: List[str] = []
+                for key in ['article:tag', 'topics', 'tags', 'taxonomy-tags', 'primaryTag']:
+                    val = metadata.get(key)
+                    if isinstance(val, list):
+                        for v in val:
+                            if isinstance(v, str) and v.strip():
+                                # split comma-separated values
+                                topics_collected.extend([x.strip() for x in v.split(',') if x.strip()])
+                    elif isinstance(val, str) and val.strip():
+                        topics_collected.extend([x.strip() for x in val.split(',') if x.strip()])
+                # de-duplicate while preserving order
+                seen = set()
+                topics = [t for t in topics_collected if not (t in seen or seen.add(t))]
 
             # Derive categories from multiple sources: meta, breadcrumbs, URL
             categories_set: Set[str] = set()
             # 1) Meta-based sections
-            for key in ['article:section', 'og:section', 'section', 'article:category']:
+            for key in ['article:section', 'og:section', 'section', 'article:category', 'pageSection', 'primaryTopic', 'topics', 'where']:
                 val = metadata.get(key)
                 if isinstance(val, list):
                     for v in val:
                         if isinstance(v, str) and v.strip():
-                            categories_set.add(v.strip())
+                            parts = [p.strip() for p in v.split(',') if p.strip()]
+                            for p in parts:
+                                categories_set.add(p)
                 elif isinstance(val, str) and val.strip():
-                    categories_set.add(val.strip())
+                    parts = [p.strip() for p in val.split(',') if p.strip()]
+                    for p in parts:
+                        categories_set.add(p)
 
             # 2) Breadcrumbs
             breadcrumb_selectors = [
@@ -790,8 +842,49 @@ class AlJazeeraScraper:
             except Exception:
                 pass
             
-            # Extract image URLs (already processed with full URLs)
+            # Extract image URLs (already processed with full URLs) + meta/JSON-LD fallbacks
             image_urls = [img['url'] for img in images if img['url']]
+            # Meta image candidates
+            for k in ['og:image', 'twitter:image:src', 'image']:
+                val = metadata.get(k)
+                if isinstance(val, list):
+                    for v in val:
+                        if isinstance(v, str) and v.strip():
+                            image_urls.append(v.strip())
+                elif isinstance(val, str) and val.strip():
+                    image_urls.append(val.strip())
+            # JSON-LD images
+            try:
+                jsonld_source = metadata.get('jsonld')
+                jsonld_candidates = jsonld_source if isinstance(jsonld_source, list) else [jsonld_source] if jsonld_source else []
+                for block in jsonld_candidates:
+                    if isinstance(block, dict) and 'image' in block:
+                        img_block = block['image']
+                        if isinstance(img_block, list):
+                            for it in img_block:
+                                if isinstance(it, dict) and isinstance(it.get('url'), str):
+                                    image_urls.append(it['url'])
+                                elif isinstance(it, str):
+                                    image_urls.append(it)
+                        elif isinstance(img_block, dict) and isinstance(img_block.get('url'), str):
+                            image_urls.append(img_block['url'])
+                        elif isinstance(img_block, str):
+                            image_urls.append(img_block)
+            except Exception:
+                pass
+            # Normalize relative image URLs
+            normalized_images: List[str] = []
+            for u in image_urls:
+                if u and not u.startswith('http'):
+                    if u.startswith('/'):
+                        normalized_images.append(f"https://www.aljazeera.net{u}")
+                    else:
+                        normalized_images.append(f"https://www.aljazeera.net/{u}")
+                else:
+                    normalized_images.append(u)
+            # De-duplicate while preserving order
+            seen_imgs = set()
+            image_urls = [u for u in normalized_images if u and not (u in seen_imgs or seen_imgs.add(u))]
             
             return {
                 'url': url,
