@@ -98,7 +98,7 @@ class AlJazeeraScraper:
         elif tashkil_method == "mishkal":
             # For Mishkal, create a small thread pool and a per-thread Mishkal instance for concurrency
             self.tashkil_ai = None
-            max_workers = max(2, min(4, (os.cpu_count() or 2)))
+            max_workers = 1000
             self._tashkil_executor: Optional[ThreadPoolExecutor] = ThreadPoolExecutor(max_workers=max_workers)
             # Thread-local store: each worker thread gets its own Mishkal instance (avoids cross-thread state)
             self._tashkil_thread_local = threading.local()
@@ -110,14 +110,14 @@ class AlJazeeraScraper:
                 self.tashkil_ai = None
             else:
                 # Use the same executor infra for Gemini calls to avoid blocking the event loop
-                max_workers = max(2, min(4, (os.cpu_count() or 2)))
+                max_workers = 1000
                 self._tashkil_executor: Optional[ThreadPoolExecutor] = ThreadPoolExecutor(max_workers=max_workers)
                 self.tashkil_ai = TashkilUnified(method="gemini", api_key=api_key)
                 self.logger.info(f"Initialized TashkilUnified with Gemini method (workers={max_workers})")
         else:
             self.logger.warning(f"Unknown TASHKIL_METHOD: {tashkil_method}. Using Gemini if API key available.")
             if api_key:
-                max_workers = max(2, min(4, (os.cpu_count() or 2)))
+                max_workers = 1000
                 self._tashkil_executor: Optional[ThreadPoolExecutor] = ThreadPoolExecutor(max_workers=max_workers)
                 self.tashkil_ai = TashkilUnified(method="gemini", api_key=api_key)
                 self.logger.info(f"Initialized TashkilUnified with Gemini method (workers={max_workers})")
