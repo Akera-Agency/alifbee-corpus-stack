@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor
+import threading
 
 # Load environment variables from .env file if it exists
 load_dotenv()
@@ -95,24 +96,31 @@ class AlJazeeraScraper:
             self.tashkil_ai = None
             self.logger.info("Tashkil disabled via TASHKIL_ENABLED=0")
         elif tashkil_method == "mishkal":
-            # For Mishkal, defer initialization to a dedicated single thread to keep SQLite on one thread
+            # For Mishkal, create a small thread pool and a per-thread Mishkal instance for concurrency
             self.tashkil_ai = None
-            self._tashkil_executor: Optional[ThreadPoolExecutor] = ThreadPoolExecutor(max_workers=1)
-            self._tashkil_lock: asyncio.Lock = asyncio.Lock()
-            self._tashkil_ai_thread = None  # Will be created inside executor thread on first use
-            self.logger.info("Mishkal will be initialized lazily in a dedicated thread for thread-safety")
+            max_workers = max(2, min(4, (os.cpu_count() or 2)))
+            self._tashkil_executor: Optional[ThreadPoolExecutor] = ThreadPoolExecutor(max_workers=max_workers)
+            # Thread-local store: each worker thread gets its own Mishkal instance (avoids cross-thread state)
+            self._tashkil_thread_local = threading.local()
+            self._tashkil_ai_thread = None  # Kept for compatibility; not used
+            self.logger.info(f"Mishkal will be initialized lazily with per-thread instances (workers={max_workers})")
         elif tashkil_method == "gemini":
             if not api_key:
                 self.logger.warning("GEMINI_API_KEY not found. Tashkil functionality will be disabled.")
                 self.tashkil_ai = None
             else:
+                # Use the same executor infra for Gemini calls to avoid blocking the event loop
+                max_workers = max(2, min(4, (os.cpu_count() or 2)))
+                self._tashkil_executor: Optional[ThreadPoolExecutor] = ThreadPoolExecutor(max_workers=max_workers)
                 self.tashkil_ai = TashkilUnified(method="gemini", api_key=api_key)
-                self.logger.info("Initialized TashkilUnified with Gemini method")
+                self.logger.info(f"Initialized TashkilUnified with Gemini method (workers={max_workers})")
         else:
             self.logger.warning(f"Unknown TASHKIL_METHOD: {tashkil_method}. Using Gemini if API key available.")
             if api_key:
+                max_workers = max(2, min(4, (os.cpu_count() or 2)))
+                self._tashkil_executor: Optional[ThreadPoolExecutor] = ThreadPoolExecutor(max_workers=max_workers)
                 self.tashkil_ai = TashkilUnified(method="gemini", api_key=api_key)
-                self.logger.info("Initialized TashkilUnified with Gemini method")
+                self.logger.info(f"Initialized TashkilUnified with Gemini method (workers={max_workers})")
             else:
                 self.tashkil_ai = None
         
@@ -565,14 +573,22 @@ class AlJazeeraScraper:
                 return ""
             if getattr(self, 'tashkil_method', '') == 'mishkal' and hasattr(self, '_tashkil_executor'):
                 loop = asyncio.get_running_loop()
-                async with self._tashkil_lock:
-                    def ensure_mishkal_and_tashkeel():
-                        if self.tashkil_ai is None:
-                            from tashkil.tashkil_unified import TashkilUnified as _TU  # type: ignore
-                            self.tashkil_ai = _TU(method="mishkal")
-                        return self.tashkil_ai.tashkeel(input_text)
-                    return await loop.run_in_executor(self._tashkil_executor, ensure_mishkal_and_tashkeel)
+                def ensure_mishkal_and_tashkeel():
+                    # One Mishkal instance per worker thread
+                    local_store = getattr(self, '_tashkil_thread_local', None)
+                    if local_store is None:
+                        self._tashkil_thread_local = threading.local()
+                        local_store = self._tashkil_thread_local
+                    if not hasattr(local_store, 'tashkil_ai') or local_store.tashkil_ai is None:
+                        from tashkil.tashkil_unified import TashkilUnified as _TU  # type: ignore
+                        local_store.tashkil_ai = _TU(method="mishkal")
+                    return local_store.tashkil_ai.tashkeel(input_text)
+                return await loop.run_in_executor(self._tashkil_executor, ensure_mishkal_and_tashkeel)
             elif self.tashkil_ai:
+                loop = asyncio.get_running_loop()
+                # Route to the shared executor to use the same package for both methods
+                if hasattr(self, '_tashkil_executor') and self._tashkil_executor is not None:
+                    return await loop.run_in_executor(self._tashkil_executor, self.tashkil_ai.tashkeel, input_text)
                 return await asyncio.to_thread(self.tashkil_ai.tashkeel, input_text)
             else:
                 return input_text
@@ -604,14 +620,26 @@ class AlJazeeraScraper:
                 self.logger.warning(
                     f"Sentence count mismatch (orig={len(original_sentences)} vs tash={len(tashkil_sentences)}). Falling back to per-sentence."
                 )
-                tashkil_sentences = []
-                for s in original_sentences:
-                    try:
-                        raw = await tashkeel_once(s)
-                        tashkil_sentences.append(self.clean_tashkil_output(raw))
-                    except Exception:
-                        # If diacritization fails for a sentence, keep the original to preserve alignment
-                        tashkil_sentences.append(s)
+                # Run per-sentence tashkeel concurrently using the existing executor
+                try:
+                    tasks = [tashkeel_once(s) for s in original_sentences]
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+                    tashkil_sentences = []
+                    for idx, res in enumerate(results):
+                        if isinstance(res, Exception):
+                            # Preserve alignment on failure
+                            tashkil_sentences.append(original_sentences[idx])
+                        else:
+                            tashkil_sentences.append(self.clean_tashkil_output(res))
+                except Exception:
+                    # Fallback to sequential processing if gather fails unexpectedly
+                    tashkil_sentences = []
+                    for s in original_sentences:
+                        try:
+                            raw = await tashkeel_once(s)
+                            tashkil_sentences.append(self.clean_tashkil_output(raw))
+                        except Exception:
+                            tashkil_sentences.append(s)
                 full_tashkil_text = " ".join(tashkil_sentences)
             else:
                 # No tashkil engine configured; mirror original to maintain alignment
@@ -955,90 +983,92 @@ class AlJazeeraScraper:
             if not pool:
                 return False
             async with pool.acquire() as conn:
-                # Store or update article, then get id
-                # Normalize complex types. If DB columns are arrays/jsonb, use native types; else JSON-encode.
-                metadata_val = article_data.get("metadata")
-                tags_val = article_data.get("tags")
-                categories_val = article_data.get("categories")
-                image_urls_val = article_data.get("image_urls")
-                # Detect if connection expects arrays for tags/categories/image_urls by trying to use them as arrays.
-                # We will pass lists directly; if DB expects text, it will error and be caught.
-                article_record = {
-                    "url": article_data["url"],
-                    "title": article_data["title"],
-                    "metadata": metadata_val if isinstance(metadata_val, (dict, list)) else metadata_val,
-                    "slug": article_data["slug"],
-                    "published_at": article_data["published_at"],
-                    "tags": tags_val if isinstance(tags_val, list) else ([] if tags_val is None else [str(tags_val)]),
-                    "categories": categories_val if isinstance(categories_val, list) else ([] if categories_val is None else [str(categories_val)]),
-                    "image_urls": image_urls_val if isinstance(image_urls_val, list) else ([] if image_urls_val is None else [str(image_urls_val)]),
-                    "content": article_data["content"],
-                    "tashkil": article_data.get("tashkil", "")
-                }
-                existing = await conn.fetchrow("SELECT id FROM articles WHERE url = $1", article_record["url"])
-                if existing:
-                    article_id = existing["id"]
-                    # Use explicit casts to jsonb/array where appropriate
-                    await conn.execute(
-                        "UPDATE articles SET title=$2, metadata=$3::jsonb, slug=$4, published_at=$5, tags=$6::text[], categories=$7::text[], image_urls=$8::text[], content=$9, tashkil=$10 WHERE id=$1",
-                        article_id,
-                        article_record["title"],
-                        json.dumps(article_record["metadata"], ensure_ascii=False) if isinstance(article_record["metadata"], (dict, list)) else article_record["metadata"],
-                        article_record["slug"],
-                        article_record["published_at"],
-                        article_record["tags"],
-                        article_record["categories"],
-                        article_record["image_urls"],
-                        article_record["content"],
-                        article_record["tashkil"],
-                    )
-                else:
-                    article_id = await conn.fetchval(
-                        "INSERT INTO articles (url,title,metadata,slug,published_at,tags,categories,image_urls,content,tashkil) VALUES ($1,$2,$3::jsonb,$4,$5,$6::text[],$7::text[],$8::text[],$9,$10) RETURNING id",
-                        article_record["url"],
-                        article_record["title"],
-                        json.dumps(article_record["metadata"], ensure_ascii=False) if isinstance(article_record["metadata"], (dict, list)) else article_record["metadata"],
-                        article_record["slug"],
-                        article_record["published_at"],
-                        article_record["tags"],
-                        article_record["categories"],
-                        article_record["image_urls"],
-                        article_record["content"],
-                        article_record["tashkil"],
-                    )
-                self.logger.info(f"Stored article with ID {article_id}: {article_data['title'][:30]}...")
+                # Use a transaction to batch operations for speed and consistency
+                async with conn.transaction():
+                    # Store or update article, then get id
+                    # Normalize complex types. If DB columns are arrays/jsonb, use native types; else JSON-encode.
+                    metadata_val = article_data.get("metadata")
+                    tags_val = article_data.get("tags")
+                    categories_val = article_data.get("categories")
+                    image_urls_val = article_data.get("image_urls")
+                    # Detect if connection expects arrays for tags/categories/image_urls by trying to use them as arrays.
+                    # We will pass lists directly; if DB expects text, it will error and be caught.
+                    article_record = {
+                        "url": article_data["url"],
+                        "title": article_data["title"],
+                        "metadata": metadata_val if isinstance(metadata_val, (dict, list)) else metadata_val,
+                        "slug": article_data["slug"],
+                        "published_at": article_data["published_at"],
+                        "tags": tags_val if isinstance(tags_val, list) else ([] if tags_val is None else [str(tags_val)]),
+                        "categories": categories_val if isinstance(categories_val, list) else ([] if categories_val is None else [str(categories_val)]),
+                        "image_urls": image_urls_val if isinstance(image_urls_val, list) else ([] if image_urls_val is None else [str(image_urls_val)]),
+                        "content": article_data["content"],
+                        "tashkil": article_data.get("tashkil", "")
+                    }
+                    existing = await conn.fetchrow("SELECT id FROM articles WHERE url = $1", article_record["url"])
+                    if existing:
+                        article_id = existing["id"]
+                        # Use explicit casts to jsonb/array where appropriate
+                        await conn.execute(
+                            "UPDATE articles SET title=$2, metadata=$3::jsonb, slug=$4, published_at=$5, tags=$6::text[], categories=$7::text[], image_urls=$8::text[], content=$9, tashkil=$10 WHERE id=$1",
+                            article_id,
+                            article_record["title"],
+                            json.dumps(article_record["metadata"], ensure_ascii=False) if isinstance(article_record["metadata"], (dict, list)) else article_record["metadata"],
+                            article_record["slug"],
+                            article_record["published_at"],
+                            article_record["tags"],
+                            article_record["categories"],
+                            article_record["image_urls"],
+                            article_record["content"],
+                            article_record["tashkil"],
+                        )
+                    else:
+                        article_id = await conn.fetchval(
+                            "INSERT INTO articles (url,title,metadata,slug,published_at,tags,categories,image_urls,content,tashkil) VALUES ($1,$2,$3::jsonb,$4,$5,$6::text[],$7::text[],$8::text[],$9,$10) RETURNING id",
+                            article_record["url"],
+                            article_record["title"],
+                            json.dumps(article_record["metadata"], ensure_ascii=False) if isinstance(article_record["metadata"], (dict, list)) else article_record["metadata"],
+                            article_record["slug"],
+                            article_record["published_at"],
+                            article_record["tags"],
+                            article_record["categories"],
+                            article_record["image_urls"],
+                            article_record["content"],
+                            article_record["tashkil"],
+                        )
+                    self.logger.info(f"Stored article with ID {article_id}: {article_data['title'][:30]}...")
 
-                # Insert sentences and collect their IDs
-                sentence_id_map: Dict[str, Any] = {}
-                for sentence in sentences:
-                    temp_id = sentence.pop("id", None)
-                    sid = await conn.fetchval(
-                        "INSERT INTO sentences (article_id, text, tashkil) VALUES ($1,$2,$3) RETURNING id",
-                        article_id,
-                        sentence["text"],
-                        sentence["tashkil"],
-                    )
-                    if temp_id is not None:
-                        sentence_id_map[temp_id] = sid
-                self.logger.info(f"Stored {len(sentences)} sentences")
+                    # Insert sentences and collect their IDs
+                    sentence_id_map: Dict[str, Any] = {}
+                    for sentence in sentences:
+                        temp_id = sentence.pop("id", None)
+                        sid = await conn.fetchval(
+                            "INSERT INTO sentences (article_id, text, tashkil) VALUES ($1,$2,$3) RETURNING id",
+                            article_id,
+                            sentence["text"],
+                            sentence["tashkil"],
+                        )
+                        if temp_id is not None:
+                            sentence_id_map[temp_id] = sid
+                    self.logger.info(f"Stored {len(sentences)} sentences")
 
-                # Prepare and insert words
-                processed_words = []
-                for word in words:
-                    temp_sentence_id = word.pop("sentence_id", None)
-                    if temp_sentence_id in sentence_id_map:
-                        sentence_id = sentence_id_map[temp_sentence_id]
-                        w_id = self.generate_word_id(word["word"] + str(len(processed_words)))
-                        processed_words.append((w_id, word["word"], word["word_without_ichkal"], sentence_id))
+                    # Prepare and insert words
+                    processed_words = []
+                    for word in words:
+                        temp_sentence_id = word.pop("sentence_id", None)
+                        if temp_sentence_id in sentence_id_map:
+                            sentence_id = sentence_id_map[temp_sentence_id]
+                            w_id = self.generate_word_id(word["word"] + str(len(processed_words)))
+                            processed_words.append((w_id, word["word"], word["word_without_ichkal"], sentence_id))
 
-                if processed_words:
-                    await conn.executemany(
-                        "INSERT INTO word_with_ichkal (id, word, word_without_ichkal, sentence_id) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING",
-                        processed_words,
-                    )
-                    self.logger.info(f"Stored {len(processed_words)} words")
+                    if processed_words:
+                        await conn.executemany(
+                            "INSERT INTO word_with_ichkal (id, word, word_without_ichkal, sentence_id) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING",
+                            processed_words,
+                        )
+                        self.logger.info(f"Stored {len(processed_words)} words")
 
-                return True
+                    return True
         except Exception as e:
             self.logger.error(f"Failed to store data in database: {str(e)}")
             return False
