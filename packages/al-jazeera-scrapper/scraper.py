@@ -1146,7 +1146,7 @@ class AlJazeeraScraper:
                 
         return clean_results
         
-    async def scrape_all_sitemaps(self, limit_sitemaps: Optional[int] = None) -> Dict[str, Any]:
+    async def scrape_all_sitemaps(self, limit_sitemaps: Optional[int] = None, start_index: int = 0) -> Dict[str, Any]:
         """Main workflow: Fetch main sitemap → daily sitemaps → articles → extract data"""
         start_time = time.time()
         
@@ -1161,10 +1161,19 @@ class AlJazeeraScraper:
             
         sitemap_urls = main_sitemap['sitemap_urls']
         
+        # Apply start index if specified
+        if start_index > 0:
+            if start_index >= len(sitemap_urls):
+                self.logger.warning(f"Start index {start_index} exceeds available sitemaps ({len(sitemap_urls)}). Starting from beginning.")
+                start_index = 0
+            else:
+                sitemap_urls = sitemap_urls[start_index:]
+                self.logger.info(f"Starting from sitemap index {start_index} ({len(sitemap_urls)} sitemaps remaining)")
+        
         # Apply limit if specified
         if limit_sitemaps:
             sitemap_urls = sitemap_urls[:limit_sitemaps]
-            self.logger.info(f"Limited to first {limit_sitemaps} sitemaps")
+            self.logger.info(f"Limited to {limit_sitemaps} sitemaps")
             
         self.logger.info(f"Processing {len(sitemap_urls)} daily sitemaps")
         
@@ -1252,16 +1261,18 @@ async def main():
     scraper = AlJazeeraScraper()
     
     # Parse command line arguments
-    limit_sitemaps = None
-    if len(sys.argv) > 1:
-        try:
-            limit_sitemaps = int(sys.argv[1])
-        except ValueError:
-            print(f"Invalid limit: {sys.argv[1]}. Using default (no limit)")
+    import argparse
+    parser = argparse.ArgumentParser(description="Al Jazeera scraper")
+    parser.add_argument("-l", "--limit", type=int, help="Limit number of sitemaps to process")
+    parser.add_argument("-s", "--start", type=int, default=0, help="Start from sitemap index (0-based)")
+    args = parser.parse_args()
+    
+    limit_sitemaps = args.limit
+    start_index = max(0, args.start)  # Ensure non-negative
     
     try:
         # Run the full workflow
-        results = await scraper.scrape_all_sitemaps(limit_sitemaps=limit_sitemaps)
+        results = await scraper.scrape_all_sitemaps(limit_sitemaps=limit_sitemaps, start_index=start_index)
         
         if results.get('error'):
             print(f"\n❌ Scraping failed: {results['error']}")
@@ -1270,6 +1281,7 @@ async def main():
         # Display results
         stats = results['stats']
         print(f"\n🎉 === Scraping Results ===")
+        print(f"Starting index: {start_index}")
         print(f"Sitemaps processed: {stats['sitemaps_processed']}")
         print(f"Articles found: {stats['articles_found']}")
         print(f"Articles scraped: {stats['successful_articles']}/{stats['total_articles']}")
